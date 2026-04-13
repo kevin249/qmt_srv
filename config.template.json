@@ -1,0 +1,16 @@
+{
+  "xt": {
+    "token": "",
+    "stock_active": true,
+    "futures_active": false,
+    "option_active": false,
+    "simulation": false,
+    "account_type": "STOCK",
+    "qmt_path": "D:\\qmt",
+    "account_id": "123456"
+  },
+  "rpc": {
+    "rep_address": "tcp://*:20140",
+    "pub_address": "tcp://*:20141"
+  }
+}

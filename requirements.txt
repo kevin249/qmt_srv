@@ -1,0 +1,3 @@
+vnpy>=4.3,<4.4
+vnpy-rpcservice>=1.1,<1.2
+vnpy-xt>=1.4,<1.5

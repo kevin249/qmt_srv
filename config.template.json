@@ -12,5 +12,24 @@
   "rpc": {
     "rep_address": "tcp://*:20140",
     "pub_address": "tcp://*:20141"
+  },
+  "logging": {
+    "enabled": true,
+    "level": "INFO",
+    "console": true,
+    "publish_rpc_log_event": true,
+    "categories": {
+      "lifecycle": true,
+      "rpc": true,
+      "market_data": false,
+      "snapshot": true,
+      "account": true,
+      "position": true,
+      "order": true,
+      "trade": true,
+      "history": false,
+      "contract": false,
+      "heartbeat": false
+    }
   }
 }

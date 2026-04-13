@@ -95,6 +95,47 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(built["xt"]["qmt_path"], r"D:\QMT")
 
+    def test_build_bridge_config_adds_logging_defaults(self) -> None:
+        built = app.build_bridge_config(
+            {
+                "xt": {
+                    "qmt_path": r"D:\QMT",
+                    "account_id": "123456",
+                },
+                "rpc": {},
+            }
+        )
+
+        self.assertEqual(built["logging"]["level"], "INFO")
+        self.assertTrue(built["logging"]["enabled"])
+        self.assertTrue(built["logging"]["categories"]["order"])
+        self.assertFalse(built["logging"]["categories"]["market_data"])
+
+    def test_build_bridge_config_allows_logging_override(self) -> None:
+        built = app.build_bridge_config(
+            {
+                "xt": {
+                    "qmt_path": r"D:\QMT",
+                    "account_id": "123456",
+                },
+                "rpc": {},
+                "logging": {
+                    "enabled": True,
+                    "level": "ERROR",
+                    "categories": {
+                        "order": True,
+                        "market_data": True,
+                    },
+                    "console": False,
+                    "publish_rpc_log_event": True,
+                },
+            }
+        )
+
+        self.assertEqual(built["logging"]["level"], "ERROR")
+        self.assertTrue(built["logging"]["categories"]["market_data"])
+        self.assertFalse(built["logging"]["console"])
+
     def test_start_server_uses_bridge_class(self) -> None:
         bridge = app.start_server(
             config={

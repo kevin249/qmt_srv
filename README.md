@@ -10,6 +10,7 @@
 
 1. 直接绕过 `vnpy_xt` 的兼容性问题，改为原生使用 `xtquant`
 2. 保持 `vnpy.rpc.RpcServer` 风格的 ZeroMQ 协议，方便已有客户端无缝接入
+3. 为迅投miniqmt提供rpc服务，可以使用veighna station进行连接。
 
 当前实现已经实测打通：
 

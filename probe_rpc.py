@@ -41,8 +41,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Minimal RPC probe for XTQ Bridge")
     parser.add_argument("--req", default=DEFAULT_REQ_ADDRESS, help="REQ address")
     parser.add_argument("--timeout", type=int, default=5000, help="RPC timeout in ms")
+    parser.add_argument("--client-name", default="probe_rpc", help="Client name for register_client")
     args = parser.parse_args()
 
+    try:
+        rpc_call(args.req, "register_client", args.client_name, {"tool": "probe_rpc"}, timeout=args.timeout)
+    except RuntimeError as exc:
+        if "KeyError: 'register_client'" not in str(exc):
+            raise
     accounts = rpc_call(args.req, "get_all_accounts", timeout=args.timeout)
     positions = rpc_call(args.req, "get_all_positions", timeout=args.timeout)
 

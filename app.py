@@ -14,6 +14,19 @@ CONFIG_USER_PATH = Path(__file__).with_name("config.user.json")
 DEFAULT_REP_ADDRESS = "tcp://*:20140"
 DEFAULT_PUB_ADDRESS = "tcp://*:20141"
 DEFAULT_EVENT_QUEUE_SIZE = 10000
+DEFAULT_LOG_CATEGORIES = {
+    "lifecycle": True,
+    "rpc": True,
+    "market_data": False,
+    "snapshot": True,
+    "account": True,
+    "position": True,
+    "order": True,
+    "trade": True,
+    "history": False,
+    "contract": False,
+    "heartbeat": False,
+}
 
 
 def strip_json_comments(text: str) -> str:
@@ -103,11 +116,14 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
     """Build normalized bridge config from user JSON config."""
     xt = config.get("xt", {})
     rpc = config.get("rpc", {})
+    logging_config = config.get("logging", {})
 
     if not isinstance(xt, dict):
         raise ValueError("xt section must be an object")
     if not isinstance(rpc, dict):
         raise ValueError("rpc section must be an object")
+    if not isinstance(logging_config, dict):
+        raise ValueError("logging section must be an object")
 
     qmt_path = normalize_qmt_root_path(xt.get("qmt_path", ""))
     account_id = str(xt.get("account_id", "") or "").strip()
@@ -133,6 +149,16 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
         "rpc": {
             "rep_address": str(rpc.get("rep_address", DEFAULT_REP_ADDRESS) or DEFAULT_REP_ADDRESS),
             "pub_address": str(rpc.get("pub_address", DEFAULT_PUB_ADDRESS) or DEFAULT_PUB_ADDRESS),
+        },
+        "logging": {
+            "enabled": bool(logging_config.get("enabled", True)),
+            "level": str(logging_config.get("level", "INFO") or "INFO").upper(),
+            "console": bool(logging_config.get("console", True)),
+            "publish_rpc_log_event": bool(logging_config.get("publish_rpc_log_event", True)),
+            "categories": {
+                **DEFAULT_LOG_CATEGORIES,
+                **(logging_config.get("categories", {}) or {}),
+            },
         },
     }
 

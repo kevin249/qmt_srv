@@ -20,6 +20,32 @@ from .utils import GATEWAY_NAME, format_history_time, normalize_qmt_root_path, r
 
 
 class XtQuantBridge:
+    LOG_LEVELS = {
+        "DEBUG": 10,
+        "INFO": 20,
+        "WARNING": 30,
+        "ERROR": 40,
+    }
+    DEFAULT_LOGGING_CONFIG = {
+        "enabled": True,
+        "level": "INFO",
+        "console": True,
+        "publish_rpc_log_event": True,
+        "categories": {
+            "lifecycle": True,
+            "rpc": True,
+            "market_data": False,
+            "snapshot": True,
+            "account": True,
+            "position": True,
+            "order": True,
+            "trade": True,
+            "history": False,
+            "contract": False,
+            "heartbeat": False,
+        },
+    }
+
     def __init__(
         self,
         config: dict[str, Any],
@@ -44,12 +70,22 @@ class XtQuantBridge:
         self.publisher = EventPublisher(self.rpc_server, maxsize=self.xt_config["event_queue_size"])
         self.callback_router = XtQuantCallbackRouter(self, self.translator)
         self.rpc_handler = RpcRequestHandler(self)
+        raw_logging_config = config.get("logging", {}) or {}
+        self.logging_config = {
+            **self.DEFAULT_LOGGING_CONFIG,
+            **raw_logging_config,
+            "categories": {
+                **self.DEFAULT_LOGGING_CONFIG["categories"],
+                **(raw_logging_config.get("categories", {}) or {}),
+            },
+        }
 
         self.qmt_root = normalize_qmt_root_path(self.xt_config["qmt_path"])
         self.userdata_path = resolve_userdata_path(self.qmt_root)
         self.account = self.stock_account_class(self.xt_config["account_id"], self.xt_config["account_type"])
         self.xt_trader = None
         self.running = False
+        self.registered_clients: dict[str, dict[str, Any]] = {}
         self.subscriptions: dict[str, int] = {}
         self._order_counter = count(1)
         self.local_order_sysid_map: dict[str, str] = {}
@@ -60,6 +96,47 @@ class XtQuantBridge:
         self.positions: dict[str, Any] = {}
         self.accounts: dict[str, Any] = {}
         self.contracts: dict[str, Any] = {}
+
+    @staticmethod
+    def _safe_attr(data: Any, name: str, default: Any = "") -> Any:
+        return getattr(data, name, default)
+
+    def should_log(self, level: str, category: str) -> bool:
+        if not self.logging_config.get("enabled", True):
+            return False
+        categories = self.logging_config.get("categories", {})
+        if not categories.get(category, False):
+            return False
+        current = self.LOG_LEVELS.get(str(self.logging_config.get("level", "INFO")).upper(), 20)
+        target = self.LOG_LEVELS.get(level.upper(), 20)
+        return target >= current
+
+    def format_log_message(self, level: str, category: str, message: str, **fields: Any) -> str:
+        extras = " ".join(f"{key}={value}" for key, value in fields.items() if value != "")
+        base = f"[{level.upper()}][{category}] {message}"
+        return f"{base} {extras}".rstrip()
+
+    def emit_log(self, level: str, category: str, message: str, **fields: Any) -> None:
+        if not self.should_log(level, category):
+            return
+
+        formatted = self.format_log_message(level, category, message, **fields)
+        if self.logging_config.get("console", True):
+            print(f"[XTQ Bridge] {formatted}")
+        if self.logging_config.get("publish_rpc_log_event", True):
+            self.publish_log(formatted)
+
+    def log_debug(self, category: str, message: str, **fields: Any) -> None:
+        self.emit_log("DEBUG", category, message, **fields)
+
+    def log_info(self, category: str, message: str, **fields: Any) -> None:
+        self.emit_log("INFO", category, message, **fields)
+
+    def log_warning(self, category: str, message: str, **fields: Any) -> None:
+        self.emit_log("WARNING", category, message, **fields)
+
+    def log_error(self, category: str, message: str, **fields: Any) -> None:
+        self.emit_log("ERROR", category, message, **fields)
 
     def start(self) -> None:
         self.register_rpc()
@@ -96,6 +173,7 @@ class XtQuantBridge:
 
     def register_rpc(self) -> None:
         for name in (
+            "register_client",
             "subscribe",
             "send_order",
             "cancel_order",
@@ -118,7 +196,7 @@ class XtQuantBridge:
 
     def initialize_market_data(self) -> None:
         self.xtdata.connect()
-        self.publish_log("market data initialized")
+        self.log_info("lifecycle", "market data connected")
 
     def initialize_trading(self) -> None:
         session_id = int(self.xt_config.get("session_id") or 0)
@@ -134,24 +212,48 @@ class XtQuantBridge:
         if subscribe_result != 0:
             raise RuntimeError(f"xttrader subscribe failed: {subscribe_result}")
 
-        self.publish_log("trading initialized")
+        self.log_info(
+            "lifecycle",
+            "trading connected",
+            account_id=self.xt_config["account_id"],
+            account_type=self.xt_config["account_type"],
+            userdata_path=self.userdata_path,
+        )
 
     def refresh_snapshots(self) -> None:
+        account_count = 0
+        position_count = 0
+        order_count = 0
+        trade_count = 0
+
         asset = self.xt_trader.query_stock_asset(self.account)
         if asset:
             self.handle_account(self.translator.translate_account(asset))
+            account_count += 1
 
         for position in self.xt_trader.query_stock_positions(self.account) or []:
             self.handle_position(self.translator.translate_position(position))
             self.ensure_contract(position.stock_code)
+            position_count += 1
 
         for order in self.xt_trader.query_stock_orders(self.account) or []:
             self.handle_order(self.translator.translate_order(order), str(getattr(order, "order_sysid", "") or ""))
             self.ensure_contract(order.stock_code)
+            order_count += 1
 
         for trade in self.xt_trader.query_stock_trades(self.account) or []:
             self.handle_trade(self.translator.translate_trade(trade))
             self.ensure_contract(trade.stock_code)
+            trade_count += 1
+
+        self.log_info(
+            "snapshot",
+            "snapshot loaded",
+            accounts=account_count,
+            positions=position_count,
+            orders=order_count,
+            trades=trade_count,
+        )
 
     def publish_event(self, topic: str, event: Event) -> None:
         self.publisher.enqueue(topic, event)
@@ -174,22 +276,55 @@ class XtQuantBridge:
         if system_orderid:
             self.local_order_sysid_map[order.orderid] = system_orderid
         self.publish_data(EVENT_ORDER, EVENT_ORDER + order.vt_orderid, order)
+        self.log_info(
+            "order",
+            "order update",
+            vt_orderid=order.vt_orderid,
+            status=order.status.name,
+            symbol=order.vt_symbol,
+            volume=order.volume,
+            traded=order.traded,
+        )
 
     def handle_trade(self, trade) -> None:
         self.trades[trade.vt_tradeid] = trade
         self.publish_data(EVENT_TRADE, EVENT_TRADE + trade.vt_symbol, trade)
+        self.log_info(
+            "trade",
+            "trade update",
+            vt_tradeid=trade.vt_tradeid,
+            orderid=trade.vt_orderid,
+            symbol=trade.vt_symbol,
+            price=trade.price,
+            volume=trade.volume,
+        )
 
     def handle_position(self, position) -> None:
         self.positions[position.vt_positionid] = position
         self.publish_data(EVENT_POSITION, EVENT_POSITION + position.vt_symbol, position)
+        self.log_info(
+            "position",
+            "position update",
+            vt_positionid=position.vt_positionid,
+            volume=self._safe_attr(position, "volume", ""),
+            frozen=self._safe_attr(position, "frozen", ""),
+        )
 
     def handle_account(self, account) -> None:
         self.accounts[account.vt_accountid] = account
         self.publish_data(EVENT_ACCOUNT, EVENT_ACCOUNT + account.vt_accountid, account)
+        self.log_info(
+            "account",
+            "account update",
+            vt_accountid=account.vt_accountid,
+            balance=self._safe_attr(account, "balance", ""),
+            frozen=self._safe_attr(account, "frozen", ""),
+        )
 
     def handle_contract(self, contract) -> None:
         self.contracts[contract.vt_symbol] = contract
         self.publish_event(EVENT_CONTRACT, Event(EVENT_CONTRACT, contract))
+        self.log_debug("contract", "contract cached", vt_symbol=contract.vt_symbol, name=contract.name)
 
     def ensure_contract(self, xt_symbol: str):
         symbol, exchange = xt_symbol.split(".")
@@ -232,10 +367,24 @@ class XtQuantBridge:
         if req.vt_symbol not in self.subscriptions:
             seq = self.xtdata.subscribe_quote(xt_symbol, period="tick", callback=self.callback_router.on_tick_data)
             self.subscriptions[req.vt_symbol] = seq
+            self.log_info("market_data", "subscribe success", vt_symbol=req.vt_symbol, xt_symbol=xt_symbol, seq=seq)
+        else:
+            self.log_debug("market_data", "subscribe skipped", vt_symbol=req.vt_symbol, reason="already-subscribed")
 
     def send_order(self, req: OrderRequest) -> str:
         payload = self.translator.order_request_to_xt(req)
         local_orderid = f"XTQ{next(self._order_counter):010d}"
+        self.log_info(
+            "order",
+            "send_order",
+            symbol=req.symbol,
+            exchange=req.exchange.value,
+            direction=req.direction.value,
+            type=req.type.value,
+            price=req.price,
+            volume=req.volume,
+            local_orderid=local_orderid,
+        )
         self.xt_trader.order_stock_async(
             self.account,
             payload["stock_code"],
@@ -254,12 +403,14 @@ class XtQuantBridge:
         sysid = self.local_order_sysid_map.get(req.orderid)
         if sysid:
             payload = self.translator.cancel_request_to_xt(req)
+            self.log_info("order", "cancel_order", orderid=req.orderid, via_="sysid", sysid=sysid)
             self.xt_trader.cancel_order_stock_sysid_async(self.account, payload["market"], sysid)
             return
         if str(req.orderid).isdigit():
+            self.log_info("order", "cancel_order", orderid=req.orderid, via_="orderid")
             self.xt_trader.cancel_order_stock_async(self.account, int(req.orderid))
             return
-        self.publish_log(f"cancel ignored, unknown local order id: {req.orderid}")
+        self.log_warning("order", "cancel ignored", orderid=req.orderid, reason="unknown-local-orderid")
 
     def query_history(self, req):
         xt_symbol = vnpy_symbol_to_xt(req.symbol, req.exchange)
@@ -289,4 +440,18 @@ class XtQuantBridge:
             rows = symbol_data.to_dict("records")
         elif isinstance(symbol_data, list):
             rows = symbol_data
-        return [self.translator.translate_bar(xt_symbol, row, req.interval) for row in rows]
+        bars = [self.translator.translate_bar(xt_symbol, row, req.interval) for row in rows]
+        self.log_info(
+            "history",
+            "query_history",
+            vt_symbol=req.vt_symbol,
+            interval=xt_interval,
+            count=len(bars),
+        )
+        return bars
+
+    def register_client(self, client_name: str, client_meta: dict[str, Any] | None = None) -> bool:
+        meta = client_meta or {}
+        self.registered_clients[client_name] = meta
+        self.log_info("rpc", "client registered", client_name=client_name, **meta)
+        return True

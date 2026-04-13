@@ -150,7 +150,7 @@ class IntegrationTests(unittest.TestCase):
 
         bridge.start()
         bridge.publish_log("hello")
-        bridge.handle_account(SimpleNamespace(vt_accountid="XTQUANT.123456"))
+        bridge.handle_account(SimpleNamespace(vt_accountid="XTQUANT.123456", balance=0, frozen=0))
         bridge.publisher.stop()
         bridge.publisher.join()
 
@@ -161,6 +161,134 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(any(topic == EVENT_LOG for topic, _ in rpc_server.published))
         self.assertTrue(any(topic == EVENT_ACCOUNT for topic, _ in rpc_server.published))
         bridge.close()
+
+    def test_bridge_logs_connection_and_query_summary(self) -> None:
+        rpc_server = FakeRpcServer()
+        xtdata_module = FakeXtData()
+        bridge = XtQuantBridge(
+            {
+                "xt": {
+                    "token": "",
+                    "stock_active": True,
+                    "futures_active": False,
+                    "option_active": False,
+                    "simulation": True,
+                    "account_type": "STOCK",
+                    "qmt_path": r"D:\QMT\userdata_mini",
+                    "account_id": "123456",
+                    "session_id": 1,
+                    "callback_thread_pool_size": 4,
+                    "event_queue_size": 16,
+                },
+                "rpc": {
+                    "rep_address": "tcp://*:20140",
+                    "pub_address": "tcp://*:20141",
+                },
+            },
+            rpc_server=rpc_server,
+            xtdata_module=xtdata_module,
+            xtdatacenter_module=FakeXtDc(),
+            xttrader_class=FakeXtTrader,
+            stock_account_class=FakeStockAccount,
+        )
+
+        bridge.start()
+        bridge.publisher.stop()
+        bridge.publisher.join()
+        log_messages = [event.data.msg for topic, event in rpc_server.published if topic == EVENT_LOG]
+
+        self.assertTrue(any("market data connected" in message for message in log_messages))
+        self.assertTrue(any("trading connected" in message for message in log_messages))
+        self.assertTrue(any("snapshot loaded" in message for message in log_messages))
+        bridge.close()
+
+    def test_bridge_filters_logs_by_level_and_category(self) -> None:
+        rpc_server = FakeRpcServer()
+        bridge = XtQuantBridge(
+            {
+                "xt": {
+                    "token": "",
+                    "stock_active": True,
+                    "futures_active": False,
+                    "option_active": False,
+                    "simulation": True,
+                    "account_type": "STOCK",
+                    "qmt_path": r"D:\QMT\userdata_mini",
+                    "account_id": "123456",
+                    "session_id": 1,
+                    "callback_thread_pool_size": 4,
+                    "event_queue_size": 16,
+                },
+                "rpc": {
+                    "rep_address": "tcp://*:20140",
+                    "pub_address": "tcp://*:20141",
+                },
+                "logging": {
+                    "enabled": True,
+                    "level": "WARNING",
+                    "console": False,
+                    "publish_rpc_log_event": True,
+                    "categories": {
+                        "market_data": False,
+                        "order": True,
+                    },
+                },
+            },
+            rpc_server=rpc_server,
+            xtdata_module=FakeXtData(),
+            xtdatacenter_module=FakeXtDc(),
+            xttrader_class=FakeXtTrader,
+            stock_account_class=FakeStockAccount,
+        )
+
+        bridge.publisher.start()
+        bridge.log_info("market_data", "market data connected")
+        bridge.log_warning("order", "send_order failed")
+        bridge.publisher.stop()
+        bridge.publisher.join()
+
+        log_messages = [event.data.msg for topic, event in rpc_server.published if topic == EVENT_LOG]
+        self.assertFalse(any("market data connected" in message for message in log_messages))
+        self.assertTrue(any("send_order failed" in message for message in log_messages))
+
+    def test_bridge_register_client_logs_details(self) -> None:
+        rpc_server = FakeRpcServer()
+        bridge = XtQuantBridge(
+            {
+                "xt": {
+                    "token": "",
+                    "stock_active": True,
+                    "futures_active": False,
+                    "option_active": False,
+                    "simulation": True,
+                    "account_type": "STOCK",
+                    "qmt_path": r"D:\QMT\userdata_mini",
+                    "account_id": "123456",
+                    "session_id": 1,
+                    "callback_thread_pool_size": 4,
+                    "event_queue_size": 16,
+                },
+                "rpc": {
+                    "rep_address": "tcp://*:20140",
+                    "pub_address": "tcp://*:20141",
+                },
+            },
+            rpc_server=rpc_server,
+            xtdata_module=FakeXtData(),
+            xtdatacenter_module=FakeXtDc(),
+            xttrader_class=FakeXtTrader,
+            stock_account_class=FakeStockAccount,
+        )
+
+        bridge.publisher.start()
+        result = bridge.register_client("probe", {"pid": 123, "mode": "manual"})
+        bridge.publisher.stop()
+        bridge.publisher.join()
+        log_messages = [event.data.msg for topic, event in rpc_server.published if topic == EVENT_LOG]
+
+        self.assertTrue(result)
+        self.assertIn("probe", bridge.registered_clients)
+        self.assertTrue(any("client registered" in message for message in log_messages))
 
 
 if __name__ == "__main__":

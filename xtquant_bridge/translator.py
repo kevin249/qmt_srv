@@ -138,17 +138,26 @@ class DataTranslator:
         direction = POSITION_DIRECTION_XT2VT.get(getattr(xt_position, "direction", xtconstant.DIRECTION_FLAG_BUY), Direction.NET)
         if exchange in {Exchange.SSE, Exchange.SZSE, Exchange.BSE}:
             direction = Direction.NET
-        return PositionData(
+        volume = float(getattr(xt_position, "volume", 0) or 0)
+        frozen = float(getattr(xt_position, "frozen_volume", 0) or 0)
+        pos = PositionData(
             gateway_name=self.gateway_name,
             symbol=symbol,
             exchange=exchange,
             direction=direction,
-            volume=float(getattr(xt_position, "volume", 0) or 0),
-            frozen=float(getattr(xt_position, "frozen_volume", 0) or 0),
+            volume=volume,
+            frozen=frozen,
             price=float(getattr(xt_position, "open_price", 0) or 0),
-            pnl=float(getattr(xt_position, "market_value", 0) or 0),
+            pnl=float(getattr(xt_position, "profit", 0) or 0),
             yd_volume=float(getattr(xt_position, "yesterday_volume", 0) or 0),
         )
+        # Extra fields not in standard VeighNa PositionData — read by downstream adapters
+        pos.can_use_volume = float(getattr(xt_position, "can_use_volume", 0) or 0) or max(volume - frozen, 0)
+        pos.market_value = float(getattr(xt_position, "market_value", 0) or 0)
+        pos.last_price = float(getattr(xt_position, "last_price", 0) or 0)
+        pos.avg_price = float(getattr(xt_position, "avg_price", 0) or getattr(xt_position, "open_price", 0) or 0)
+        pos.profit_rate = float(getattr(xt_position, "profit_rate", 0) or 0)
+        return pos
 
     def translate_account(self, xt_asset: Any) -> AccountData:
         account = AccountData(
@@ -158,6 +167,7 @@ class DataTranslator:
             frozen=float(getattr(xt_asset, "frozen_cash", 0) or 0),
         )
         account.available = float(getattr(xt_asset, "cash", 0) or 0)
+        account.market_value = float(getattr(xt_asset, "market_value", 0) or 0)
         return account
 
     def translate_contract(self, xt_symbol: str, detail: dict[str, Any]) -> ContractData:

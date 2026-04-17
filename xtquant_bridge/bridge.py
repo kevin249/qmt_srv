@@ -199,14 +199,33 @@ class XtQuantBridge:
         self.log_info("lifecycle", "market data connected")
 
     def initialize_trading(self) -> None:
+        import os as _os
         session_id = int(self.xt_config.get("session_id") or 0)
+
+        # ── 预检：userdata 路径必须存在 ──────────────────────────────────
+        if not _os.path.isdir(self.userdata_path):
+            raise RuntimeError(
+                f"userdata 目录不存在: {self.userdata_path}\n"
+                f"  请检查 config.user.json 中 xt.qmt_path 是否正确指向 MiniQMT 安装根目录。\n"
+                f"  当前配置的 qmt_path: {self.qmt_root}"
+            )
+
+        self.log_info("lifecycle", "trading init", userdata_path=self.userdata_path, session_id=session_id)
         self.xt_trader = self.xttrader_class(self.userdata_path, session_id)
         self.xt_trader.register_callback(self.callback_router)
         self.xt_trader.start()
 
         connect_result = self.xt_trader.connect()
         if connect_result != 0:
-            raise RuntimeError(f"xttrader connect failed: {connect_result}")
+            raise RuntimeError(
+                f"xttrader connect failed (code={connect_result})\n"
+                f"  userdata_path: {self.userdata_path}\n"
+                f"  session_id: {session_id}\n"
+                f"  常见原因:\n"
+                f"    1. MiniQMT 客户端未运行或未登录 — 请先启动并登录 MiniQMT\n"
+                f"    2. userdata 路径与 MiniQMT 实际路径不符 — 检查 xt.qmt_path\n"
+                f"    3. session_id 冲突 — 修改 config.user.json 中 xt.session_id 为其他数值（如 1）"
+            )
 
         subscribe_result = self.xt_trader.subscribe(self.account)
         if subscribe_result != 0:

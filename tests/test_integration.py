@@ -1,7 +1,10 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from vnpy.event import Event
+from vnpy.trader.constant import Exchange
 from vnpy.trader.event import EVENT_ACCOUNT, EVENT_LOG, EVENT_ORDER
 
 from xtquant_bridge.bridge import XtQuantBridge
@@ -117,6 +120,16 @@ class FakeStockAccount:
 
 
 class IntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tempdir = TemporaryDirectory()
+        cls.qmt_path = Path(cls._tempdir.name) / "userdata_mini"
+        cls.qmt_path.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tempdir.cleanup()
+
     def test_bridge_start_and_publish(self) -> None:
         rpc_server = FakeRpcServer()
         xtdata_module = FakeXtData()
@@ -130,7 +143,7 @@ class IntegrationTests(unittest.TestCase):
                     "option_active": False,
                     "simulation": True,
                     "account_type": "STOCK",
-                    "qmt_path": r"D:\QMT\userdata_mini",
+                    "qmt_path": str(self.qmt_path),
                     "account_id": "123456",
                     "session_id": 1,
                     "callback_thread_pool_size": 4,
@@ -155,6 +168,8 @@ class IntegrationTests(unittest.TestCase):
         bridge.publisher.join()
 
         self.assertIn("subscribe", rpc_server.registered)
+        self.assertIn("xtdata.get_market_data_ex", rpc_server.registered)
+        self.assertIn("xtdata.call_formula_batch", rpc_server.registered)
         self.assertEqual(rpc_server.started, ("tcp://*:20140", "tcp://*:20141"))
         self.assertEqual(xtdata_module.connect_calls, [("", None, True)])
         self.assertEqual(xtdc_module.calls, [])
@@ -174,7 +189,7 @@ class IntegrationTests(unittest.TestCase):
                     "option_active": False,
                     "simulation": True,
                     "account_type": "STOCK",
-                    "qmt_path": r"D:\QMT\userdata_mini",
+                    "qmt_path": str(self.qmt_path),
                     "account_id": "123456",
                     "session_id": 1,
                     "callback_thread_pool_size": 4,
@@ -213,7 +228,7 @@ class IntegrationTests(unittest.TestCase):
                     "option_active": False,
                     "simulation": True,
                     "account_type": "STOCK",
-                    "qmt_path": r"D:\QMT\userdata_mini",
+                    "qmt_path": str(self.qmt_path),
                     "account_id": "123456",
                     "session_id": 1,
                     "callback_thread_pool_size": 4,
@@ -262,7 +277,7 @@ class IntegrationTests(unittest.TestCase):
                     "option_active": False,
                     "simulation": True,
                     "account_type": "STOCK",
-                    "qmt_path": r"D:\QMT\userdata_mini",
+                    "qmt_path": str(self.qmt_path),
                     "account_id": "123456",
                     "session_id": 1,
                     "callback_thread_pool_size": 4,
@@ -289,6 +304,45 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertIn("probe", bridge.registered_clients)
         self.assertTrue(any("client registered" in message for message in log_messages))
+
+    def test_query_history_rejects_unknown_interval(self) -> None:
+        bridge = XtQuantBridge(
+            {
+                "xt": {
+                    "token": "",
+                    "stock_active": True,
+                    "futures_active": False,
+                    "option_active": False,
+                    "simulation": True,
+                    "account_type": "STOCK",
+                    "qmt_path": str(self.qmt_path),
+                    "account_id": "123456",
+                    "session_id": 1,
+                    "callback_thread_pool_size": 4,
+                    "event_queue_size": 16,
+                },
+                "rpc": {
+                    "rep_address": "tcp://*:20140",
+                    "pub_address": "tcp://*:20141",
+                },
+            },
+            rpc_server=FakeRpcServer(),
+            xtdata_module=FakeXtData(),
+            xtdatacenter_module=FakeXtDc(),
+            xttrader_class=FakeXtTrader,
+            stock_account_class=FakeStockAccount,
+        )
+        req = SimpleNamespace(
+            symbol="000001",
+            exchange=Exchange.SSE,
+            interval="1min",
+            start=None,
+            end=None,
+            vt_symbol="000001.SSE",
+        )
+
+        with self.assertRaises(ValueError):
+            bridge.query_history(req)
 
 
 if __name__ == "__main__":

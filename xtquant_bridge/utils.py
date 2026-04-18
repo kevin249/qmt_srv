@@ -33,6 +33,15 @@ INTERVAL_VT2XT: dict[Interval, str] = {
 }
 
 
+def map_vnpy_interval_to_xt(interval: Interval | None) -> str:
+    if interval is None:
+        return "1d"
+    try:
+        return INTERVAL_VT2XT[interval]
+    except KeyError as exc:
+        raise ValueError(f"unsupported vnpy interval: {interval}") from exc
+
+
 def normalize_qmt_root_path(path: str) -> str:
     raw = str(path or "").strip()
     if not raw:

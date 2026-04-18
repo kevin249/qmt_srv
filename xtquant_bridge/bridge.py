@@ -16,7 +16,16 @@ from .callback_router import XtQuantCallbackRouter
 from .event_publisher import EventPublisher
 from .rpc_handler import RpcRequestHandler
 from .translator import DataTranslator
-from .utils import GATEWAY_NAME, format_history_time, normalize_qmt_root_path, resolve_userdata_path, vnpy_symbol_to_xt
+from .utils import (
+    GATEWAY_NAME,
+    format_history_time,
+    map_vnpy_interval_to_xt,
+    normalize_qmt_root_path,
+    resolve_userdata_path,
+    vnpy_symbol_to_xt,
+)
+from .xtdata_registry import build_xtdata_registry
+from .xtdata_rpc import XtdataMirrorExecutor
 
 
 class XtQuantBridge:
@@ -68,6 +77,8 @@ class XtQuantBridge:
         self.stock_account_class = stock_account_class
         self.translator = translator or DataTranslator()
         self.publisher = EventPublisher(self.rpc_server, maxsize=self.xt_config["event_queue_size"])
+        self.xtdata_registry = build_xtdata_registry(self.xtdata)
+        self.xtdata_executor = XtdataMirrorExecutor(self.xtdata, self.xtdata_registry, publisher=self.publisher)
         self.callback_router = XtQuantCallbackRouter(self, self.translator)
         self.rpc_handler = RpcRequestHandler(self)
         raw_logging_config = config.get("logging", {}) or {}
@@ -193,6 +204,19 @@ class XtQuantBridge:
             "get_all_active_orders",
         ):
             self.rpc_server.register(getattr(self.rpc_handler, name))
+        for rpc_name in self.xtdata_registry:
+            self.rpc_server.register(self._make_xtdata_rpc(rpc_name))
+
+    def _make_xtdata_rpc(self, rpc_name: str):
+        def xtdata_rpc_method(*args, **kwargs):
+            return self.call_xtdata(rpc_name, *args, **kwargs)
+
+        xtdata_rpc_method.__name__ = rpc_name
+        return xtdata_rpc_method
+
+    def call_xtdata(self, rpc_name: str, *args, **kwargs):
+        self.log_info("rpc", "xtdata rpc", method=rpc_name)
+        return self.xtdata_executor.call(rpc_name, *args, **kwargs)
 
     def initialize_market_data(self) -> None:
         self.xtdata.connect()
@@ -434,11 +458,7 @@ class XtQuantBridge:
     def query_history(self, req):
         xt_symbol = vnpy_symbol_to_xt(req.symbol, req.exchange)
         self.ensure_contract(xt_symbol)
-        xt_interval = "1d" if req.interval is None else {
-            Interval.MINUTE: "1m",
-            Interval.HOUR: "1h",
-            Interval.DAILY: "1d",
-        }.get(req.interval, "1d")
+        xt_interval = map_vnpy_interval_to_xt(req.interval)
         self.xtdata.download_history_data(
             xt_symbol,
             xt_interval,

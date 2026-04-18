@@ -58,6 +58,56 @@
 - `get_all_contracts`
 - `get_all_active_orders`
 
+当前同时支持两套 RPC 风格：
+
+### 1. vn.py 兼容接口
+
+保留现有的 `subscribe`、`send_order`、`cancel_order`、`query_history`、`get_*`、`get_all_*` 调用方式，方便原有客户端继续接入。
+
+说明：
+
+- `query_history` 只接受 bridge 明确支持的 vn.py 周期映射
+- 不再把未知周期静默降级成 `1d`
+- 如果调用方传入兼容层不支持的周期，会直接返回错误
+
+### 2. `xtdata` 原生镜像接口
+
+新增一套按 `xtquant.xtdata` 原生函数名暴露的 RPC 方法，函数名形如：
+
+- `xtdata.get_market_data`
+- `xtdata.get_market_data_ex`
+- `xtdata.get_local_data`
+- `xtdata.get_full_tick`
+- `xtdata.get_full_kline`
+- `xtdata.download_history_data`
+- `xtdata.download_history_data2`
+- `xtdata.subscribe_quote`
+- `xtdata.subscribe_whole_quote`
+- `xtdata.unsubscribe_quote`
+- `xtdata.get_period_list`
+- `xtdata.get_trading_calendar`
+- `xtdata.get_instrument_detail`
+- `xtdata.get_sector_list`
+- `xtdata.get_financial_data`
+- `xtdata.subscribe_formula`
+- `xtdata.call_formula`
+- `xtdata.generate_index_data`
+- `xtdata.get_l2_quote`
+- `xtdata.subscribe_l2thousand`
+- `xtdata.reconnect`
+
+镜像层规则：
+
+- `period` 按 `xtdata` 原生字符串直接透传，例如 `tick`、`1m`、`5m`、`1d`、`1w`、`1mon`
+- `dividend_type` 按 `xtdata` 原生参数直接透传，支持 `none`、`front`、`back`、`front_ratio`、`back_ratio`
+- 文档中存在但当前本地 `xtquant` 版本缺失的函数会返回明确错误，而不是静默失败
+
+订阅类镜像接口说明：
+
+- REQ/REP 返回订阅号
+- 实时回调数据通过 PUB/SUB 推送
+- topic 使用 `xtdata.subscribe_quote`、`xtdata.subscribe_whole_quote`、`xtdata.subscribe_formula` 等镜像名称
+
 当前已验证的真实链路：
 
 - 本地 `xtdata.connect()` 行情连接成功

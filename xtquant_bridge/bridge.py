@@ -214,9 +214,29 @@ class XtQuantBridge:
         xtdata_rpc_method.__name__ = rpc_name
         return xtdata_rpc_method
 
+    @staticmethod
+    def _summarize_xtdata_result(result: Any) -> str:
+        if result is None:
+            return "None"
+        if isinstance(result, dict):
+            parts = []
+            for k, v in result.items():
+                if hasattr(v, "__len__"):
+                    parts.append(f"{k}:len={len(v)}")
+                else:
+                    parts.append(f"{k}:{repr(v)[:40]}")
+            return "{" + ", ".join(parts) + "}" if parts else "{}"
+        if hasattr(result, "__len__"):
+            return f"len={len(result)}"
+        return repr(result)[:80]
+
     def call_xtdata(self, rpc_name: str, *args, **kwargs):
-        self.log_info("rpc", "xtdata rpc", method=rpc_name)
-        return self.xtdata_executor.call(rpc_name, *args, **kwargs)
+        arg_summary = repr(args)[:200] if args else ""
+        kwarg_summary = " ".join(f"{k}={repr(v)[:80]}" for k, v in kwargs.items()) if kwargs else ""
+        self.log_info("rpc", "xtdata rpc start", method=rpc_name, args=arg_summary, kwargs=kwarg_summary)
+        result = self.xtdata_executor.call(rpc_name, *args, **kwargs)
+        self.log_info("rpc", "xtdata rpc done", method=rpc_name, result=self._summarize_xtdata_result(result))
+        return result
 
     def initialize_market_data(self) -> None:
         self.xtdata.connect()

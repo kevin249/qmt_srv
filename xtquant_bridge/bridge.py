@@ -13,6 +13,7 @@ from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_OR
 from vnpy.trader.object import LogData, OrderRequest
 
 from .callback_router import XtQuantCallbackRouter
+from .csv_data_source import CsvDataSource
 from .event_publisher import EventPublisher
 from .rpc_handler import RpcRequestHandler
 from .translator import DataTranslator

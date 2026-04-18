@@ -230,10 +230,20 @@ class XtQuantBridge:
             return f"len={len(result)}"
         return repr(result)[:80]
 
+    def _make_download_progress_callback(self, rpc_name: str):
+        def callback(data):
+            if isinstance(data, dict):
+                self.log_info("rpc", "download progress", method=rpc_name, **{k: v for k, v in data.items()})
+            else:
+                self.log_info("rpc", "download progress", method=rpc_name, data=repr(data)[:200])
+        return callback
+
     def call_xtdata(self, rpc_name: str, *args, **kwargs):
         arg_summary = repr(args)[:200] if args else ""
         kwarg_summary = " ".join(f"{k}={repr(v)[:80]}" for k, v in kwargs.items()) if kwargs else ""
         self.log_info("rpc", "xtdata rpc start", method=rpc_name, args=arg_summary, kwargs=kwarg_summary)
+        if rpc_name in ("xtdata.download_history_data2", "xtdata.download_history_data") and "callback" not in kwargs:
+            kwargs = {**kwargs, "callback": self._make_download_progress_callback(rpc_name)}
         result = self.xtdata_executor.call(rpc_name, *args, **kwargs)
         self.log_info("rpc", "xtdata rpc done", method=rpc_name, result=self._summarize_xtdata_result(result))
         return result

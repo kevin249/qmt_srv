@@ -219,9 +219,15 @@ class XtQuantBridge:
         if result is None:
             return "None"
         if isinstance(result, dict):
+            if result.get("__type__") == "dataframe":
+                rows = result.get("data", {}).get("data", [])
+                return f"dataframe:rows={len(rows)}"
             parts = []
             for k, v in result.items():
-                if hasattr(v, "__len__"):
+                if isinstance(v, dict) and v.get("__type__") == "dataframe":
+                    rows = v.get("data", {}).get("data", [])
+                    parts.append(f"{k}:rows={len(rows)}")
+                elif hasattr(v, "__len__"):
                     parts.append(f"{k}:len={len(v)}")
                 else:
                     parts.append(f"{k}:{repr(v)[:40]}")

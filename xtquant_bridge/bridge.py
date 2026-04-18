@@ -462,20 +462,6 @@ class XtQuantBridge:
         start_time = format_history_time(req.start)
         end_time = format_history_time(req.end)
 
-        if hasattr(self.xtdata, "download_history_data2"):
-            self.xtdata.download_history_data2(
-                [xt_symbol],
-                xt_interval,
-                start_time,
-                end_time,
-            )
-        else:
-            self.xtdata.download_history_data(
-                xt_symbol,
-                xt_interval,
-                start_time,
-                end_time,
-            )
         query_kwargs = {
             "field_list": ["time", "open", "high", "low", "close", "volume", "amount", "openInterest"],
             "stock_list": [xt_symbol],

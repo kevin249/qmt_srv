@@ -476,14 +476,25 @@ class XtQuantBridge:
                 start_time,
                 end_time,
             )
-        result = self.xtdata.get_market_data_ex(
-            field_list=["time", "open", "high", "low", "close", "volume", "amount", "openInterest"],
-            stock_list=[xt_symbol],
-            period=xt_interval,
-            start_time=start_time,
-            end_time=end_time,
-            count=-1,
-        )
+        query_kwargs = {
+            "field_list": ["time", "open", "high", "low", "close", "volume", "amount", "openInterest"],
+            "stock_list": [xt_symbol],
+            "period": xt_interval,
+            "start_time": start_time,
+            "end_time": end_time,
+            "count": -1,
+        }
+        source = "market"
+        result = {}
+
+        if hasattr(self.xtdata, "get_local_data"):
+            result = self.xtdata.get_local_data(**query_kwargs)
+            source = "local"
+
+        if not result:
+            result = self.xtdata.get_market_data_ex(**query_kwargs)
+            source = "market"
+
         rows = []
         symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
         if hasattr(symbol_data, "to_dict"):
@@ -498,6 +509,7 @@ class XtQuantBridge:
             interval=xt_interval,
             start=start_time,
             end=end_time,
+            source=source,
             count=len(bars),
         )
         return bars

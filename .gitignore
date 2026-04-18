@@ -1,1 +1,4 @@
 config.user.json
+__pycache__/
+tests/
+docs/

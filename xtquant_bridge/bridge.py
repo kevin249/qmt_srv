@@ -459,18 +459,29 @@ class XtQuantBridge:
         xt_symbol = vnpy_symbol_to_xt(req.symbol, req.exchange)
         self.ensure_contract(xt_symbol)
         xt_interval = map_vnpy_interval_to_xt(req.interval)
-        self.xtdata.download_history_data(
-            xt_symbol,
-            xt_interval,
-            format_history_time(req.start),
-            format_history_time(req.end),
-        )
+        start_time = format_history_time(req.start)
+        end_time = format_history_time(req.end)
+
+        if hasattr(self.xtdata, "download_history_data2"):
+            self.xtdata.download_history_data2(
+                [xt_symbol],
+                xt_interval,
+                start_time,
+                end_time,
+            )
+        else:
+            self.xtdata.download_history_data(
+                xt_symbol,
+                xt_interval,
+                start_time,
+                end_time,
+            )
         result = self.xtdata.get_market_data_ex(
             field_list=["time", "open", "high", "low", "close", "volume", "amount", "openInterest"],
             stock_list=[xt_symbol],
             period=xt_interval,
-            start_time=format_history_time(req.start),
-            end_time=format_history_time(req.end),
+            start_time=start_time,
+            end_time=end_time,
             count=-1,
         )
         rows = []
@@ -485,6 +496,8 @@ class XtQuantBridge:
             "query_history",
             vt_symbol=req.vt_symbol,
             interval=xt_interval,
+            start=start_time,
+            end=end_time,
             count=len(bars),
         )
         return bars

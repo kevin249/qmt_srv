@@ -117,6 +117,8 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
     xt = config.get("xt", {})
     rpc = config.get("rpc", {})
     logging_config = config.get("logging", {})
+    csv_data_source = config.get("csv_data_source", {})
+    legacy_csv_path = str(config.get("csv_data_path", "") or "").strip()
 
     if not isinstance(xt, dict):
         raise ValueError("xt section must be an object")
@@ -124,6 +126,8 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("rpc section must be an object")
     if not isinstance(logging_config, dict):
         raise ValueError("logging section must be an object")
+    if not isinstance(csv_data_source, dict):
+        raise ValueError("csv_data_source section must be an object")
 
     qmt_path = normalize_qmt_root_path(xt.get("qmt_path", ""))
     account_id = str(xt.get("account_id", "") or "").strip()
@@ -159,6 +163,10 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
                 **DEFAULT_LOG_CATEGORIES,
                 **(logging_config.get("categories", {}) or {}),
             },
+        },
+        "csv_data_source": {
+            "path": str(csv_data_source.get("path", "") or legacy_csv_path or "").strip(),
+            "default_adjust": str(csv_data_source.get("default_adjust", "前复权") or "前复权"),
         },
     }
 

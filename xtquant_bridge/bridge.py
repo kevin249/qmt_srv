@@ -114,6 +114,8 @@ class XtQuantBridge:
         csv_path = str(csv_cfg.get("path") or "").strip()
         csv_adjust = str(csv_cfg.get("default_adjust") or "前复权")
         self.csv_source: CsvDataSource | None = CsvDataSource(csv_path, csv_adjust) if csv_path else None
+        if self.csv_source is not None and self.csv_source.default_adjust not in {"前复权", "后复权", "不复权"}:
+            self.csv_source.default_adjust = "前复权"
 
         # Track which symbols have had their financial data ensured this session
         # to avoid redundant download_financial_data calls per symbol.
@@ -717,8 +719,34 @@ class XtQuantBridge:
         source = "market"
         rows: list = []
 
+        download_args = ([xt_symbol], xt_interval, start_time, end_time)
+        if hasattr(self.xtdata, "download_history_data2"):
+            print(
+                f"[XTQ Bridge] [INFO][history] MiniQMT 历史数据下载开始 "
+                f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
+            )
+            self.xtdata.download_history_data2(*download_args)
+            print(
+                f"[XTQ Bridge] [INFO][history] MiniQMT 历史数据下载完成 "
+                f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
+            )
+        elif hasattr(self.xtdata, "download_history_data"):
+            print(
+                f"[XTQ Bridge] [INFO][history] MiniQMT 历史数据下载开始 "
+                f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
+            )
+            self.xtdata.download_history_data(*download_args)
+            print(
+                f"[XTQ Bridge] [INFO][history] MiniQMT 历史数据下载完成 "
+                f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
+            )
+
         # 1. Try local QMT cache first
         if hasattr(self.xtdata, "get_local_data"):
+            print(
+                f"[XTQ Bridge] [INFO][history] MiniQMT 本地缓存读取开始 "
+                f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
+            )
             result = self.xtdata.get_local_data(**query_kwargs)
             if result:
                 symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
@@ -728,9 +756,22 @@ class XtQuantBridge:
                     rows = symbol_data
                 if rows:
                     source = "local"
+                    print(
+                        f"[XTQ Bridge] [INFO][history] MiniQMT 本地缓存读取完成 "
+                        f"vt_symbol={req.vt_symbol} interval={xt_interval} count={len(rows)} ..."
+                    )
+                else:
+                    print(
+                        f"[XTQ Bridge] [WARN][history] MiniQMT 本地缓存无数据 "
+                        f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} count=0 ..."
+                    )
 
         # 2. If local cache is empty, try QMT market data
         if not rows:
+            print(
+                f"[XTQ Bridge] [INFO][history] MiniQMT 行情接口读取开始 "
+                f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
+            )
             result = self.xtdata.get_market_data_ex(**query_kwargs)
             symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
             if hasattr(symbol_data, "to_dict"):
@@ -739,10 +780,23 @@ class XtQuantBridge:
                 rows = symbol_data
             if rows:
                 source = "market"
+                print(
+                    f"[XTQ Bridge] [INFO][history] MiniQMT 行情接口读取完成 "
+                    f"vt_symbol={req.vt_symbol} interval={xt_interval} count={len(rows)} ..."
+                )
+            else:
+                print(
+                    f"[XTQ Bridge] [WARN][history] MiniQMT 行情接口失败 "
+                    f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} count=0 ..."
+                )
 
         # 3. Supplement any missing bars from the CSV data source
         if self.csv_source is not None:
             before = len(rows)
+            print(
+                f"[XTQ Bridge] [INFO][history] CSV 回退检查开始 "
+                f"vt_symbol={req.vt_symbol} interval={xt_interval} source={source} count={before} ..."
+            )
             rows = self._supplement_from_csv(
                 xt_symbol, rows, start_time, end_time, source,
                 period=xt_interval, dividend_type=None,
@@ -751,6 +805,11 @@ class XtQuantBridge:
                 source = "csv"
             elif len(rows) > before:
                 source = f"{source}+csv"
+        elif not rows:
+            print(
+                f"[XTQ Bridge] [WARN][history] MiniQMT 无数据且未配置 CSV 数据源 "
+                f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
+            )
 
         bars = [self.translator.translate_bar(xt_symbol, row, req.interval) for row in rows]
         self.log_info(
@@ -791,10 +850,18 @@ class XtQuantBridge:
             xt_symbol, start_time, end_time, period=period, adjust_type=dividend_type
         )
         if not csv_rows:
+            print(
+                f"[XTQ Bridge] [WARN][history] CSV 回退失败 xt_symbol={xt_symbol} "
+                f"period={period} path={csv_path} count=0 ..."
+            )
             self.log_info("history", "csv no data", xt_symbol=xt_symbol, path=csv_path)
             return qmt_rows
 
         if not qmt_rows:
+            print(
+                f"[XTQ Bridge] [WARN][history] MiniQMT 失败后改用 CSV 数据 xt_symbol={xt_symbol} "
+                f"period={period} csv_rows={len(csv_rows)} path={csv_path} ..."
+            )
             self.log_info("history", "csv fallback used", xt_symbol=xt_symbol, csv_rows=len(csv_rows), path=csv_path)
             return csv_rows
 
@@ -828,6 +895,10 @@ class XtQuantBridge:
         if not missing:
             return qmt_rows
 
+        print(
+            f"[XTQ Bridge] [INFO][history] CSV 补齐缺失数据 xt_symbol={xt_symbol} "
+            f"period={period} missing={len(missing)} path={csv_path} ..."
+        )
         self.log_info(
             "history",
             "csv supplement",

@@ -13,6 +13,10 @@
     "rep_address": "tcp://*:20140",
     "pub_address": "tcp://*:20141"
   },
+  "csv_data_source": {
+    "path": "",
+    "default_adjust": "前复权"
+  },
   "logging": {
     "enabled": true,
     "level": "INFO",

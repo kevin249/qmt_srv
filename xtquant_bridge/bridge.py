@@ -109,6 +109,11 @@ class XtQuantBridge:
         self.accounts: dict[str, Any] = {}
         self.contracts: dict[str, Any] = {}
 
+        csv_cfg = config.get("csv_data_source") or {}
+        csv_path = str(csv_cfg.get("path") or "").strip()
+        csv_adjust = str(csv_cfg.get("default_adjust") or "前复权")
+        self.csv_source: CsvDataSource | None = CsvDataSource(csv_path, csv_adjust) if csv_path else None
+
     @staticmethod
     def _safe_attr(data: Any, name: str, default: Any = "") -> Any:
         return getattr(data, name, default)
@@ -508,22 +513,40 @@ class XtQuantBridge:
             "count": -1,
         }
         source = "market"
-        result = {}
+        rows: list = []
 
+        # 1. Try local QMT cache first
         if hasattr(self.xtdata, "get_local_data"):
             result = self.xtdata.get_local_data(**query_kwargs)
-            source = "local"
+            if result:
+                symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
+                if hasattr(symbol_data, "to_dict"):
+                    rows = symbol_data.to_dict("records")
+                elif isinstance(symbol_data, list):
+                    rows = symbol_data
+                if rows:
+                    source = "local"
 
-        if not result:
+        # 2. If local cache is empty, try QMT market data
+        if not rows:
             result = self.xtdata.get_market_data_ex(**query_kwargs)
-            source = "market"
+            symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
+            if hasattr(symbol_data, "to_dict"):
+                rows = symbol_data.to_dict("records")
+            elif isinstance(symbol_data, list):
+                rows = symbol_data
+            if rows:
+                source = "market"
 
-        rows = []
-        symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
-        if hasattr(symbol_data, "to_dict"):
-            rows = symbol_data.to_dict("records")
-        elif isinstance(symbol_data, list):
-            rows = symbol_data
+        # 3. For daily bars, supplement any missing dates from the CSV data source
+        if self.csv_source is not None and xt_interval == "1d":
+            rows = self._supplement_from_csv(xt_symbol, rows, start_time, end_time, source)
+            if not rows:
+                source = "csv"
+            elif source != "csv":
+                # rows may have been partially filled from csv; keep source label if all came from QMT
+                pass
+
         bars = [self.translator.translate_bar(xt_symbol, row, req.interval) for row in rows]
         self.log_info(
             "history",
@@ -536,6 +559,49 @@ class XtQuantBridge:
             count=len(bars),
         )
         return bars
+
+    def _supplement_from_csv(
+        self,
+        xt_symbol: str,
+        qmt_rows: list,
+        start_time: str,
+        end_time: str,
+        current_source: str,
+    ) -> list:
+        """Merge *qmt_rows* with CSV rows, filling gaps that QMT did not return."""
+        csv_rows = self.csv_source.query(xt_symbol, start_time, end_time)
+        if not csv_rows:
+            return qmt_rows
+
+        if not qmt_rows:
+            self.log_info("history", "csv fallback used", xt_symbol=xt_symbol, csv_rows=len(csv_rows))
+            return csv_rows
+
+        # Build a set of dates already covered by QMT data
+        def _row_date(row) -> str:
+            t = row.get("time")
+            if t is None:
+                return ""
+            if hasattr(t, "strftime"):
+                return t.strftime("%Y-%m-%d")
+            return str(t)[:10]
+
+        qmt_dates = {_row_date(r) for r in qmt_rows}
+
+        missing = [r for r in csv_rows if r["time"].strftime("%Y-%m-%d") not in qmt_dates]
+        if not missing:
+            return qmt_rows
+
+        self.log_info(
+            "history",
+            "csv supplement",
+            xt_symbol=xt_symbol,
+            qmt_rows=len(qmt_rows),
+            missing_from_csv=len(missing),
+        )
+        combined = qmt_rows + missing
+        combined.sort(key=lambda r: _row_date(r))
+        return combined
 
     def register_client(self, client_name: str, client_meta: dict[str, Any] | None = None) -> bool:
         meta = client_meta or {}

@@ -1,4 +1,5 @@
 config.user.json
 __pycache__/
+xtquant_bridge/__pycache__/
 tests/
 docs/

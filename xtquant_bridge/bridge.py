@@ -16,6 +16,7 @@ from .callback_router import XtQuantCallbackRouter
 from .csv_data_source import CsvDataSource
 from .event_publisher import EventPublisher
 from .rpc_handler import RpcRequestHandler
+from .serialization import serialize_xtdata_result
 from .translator import DataTranslator
 from .utils import (
     CHINA_TZ,
@@ -169,6 +170,23 @@ class XtQuantBridge:
             f"[XTQ Bridge] [INFO][history] final_count={len(final_rows)} final_range={self._format_history_range(final_rows)} ...",
         ]
         print("\n".join(lines))
+
+    @staticmethod
+    def _rows_to_serialized_dataframe(rows: list[dict[str, Any]], columns: list[str]) -> dict[str, Any]:
+        import pandas as pd
+
+        normalized_rows = []
+        for row in rows:
+            normalized = {}
+            for column in columns:
+                value = row.get(column)
+                if column == "time" and value is not None:
+                    dt = parse_xt_timestamp(value)
+                    if dt is not None:
+                        value = int(dt.astimezone(CHINA_TZ).timestamp() * 1000)
+                normalized[column] = value
+            normalized_rows.append(normalized)
+        return serialize_xtdata_result(pd.DataFrame(normalized_rows, columns=columns))
 
     def should_log(self, level: str, category: str) -> bool:
         if not self.logging_config.get("enabled", True):

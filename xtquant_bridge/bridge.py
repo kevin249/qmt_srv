@@ -258,6 +258,69 @@ class XtQuantBridge:
             kwargs = {**kwargs, "callback": self._make_download_progress_callback(rpc_name)}
         result = self.xtdata_executor.call(rpc_name, *args, **kwargs)
         self.log_info("rpc", "xtdata rpc done", method=rpc_name, result=self._summarize_xtdata_result(result))
+
+        if (
+            self.csv_source is not None
+            and rpc_name in ("xtdata.get_market_data_ex", "xtdata.get_local_data")
+        ):
+            result = self._csv_supplement_xtdata_result(result, kwargs)
+
+        return result
+
+    def _csv_supplement_xtdata_result(self, result: Any, kwargs: dict) -> Any:
+        """Post-process a get_market_data_ex / get_local_data result and fill gaps from CSV."""
+        period = kwargs.get("period", "")
+        if period != "1d":
+            return result
+
+        stock_list = kwargs.get("stock_list") or []
+        start_time = str(kwargs.get("start_time") or "")
+        end_time = str(kwargs.get("end_time") or "")
+
+        # Determine adjust type from dividend_type kwarg if present
+        dividend_type = kwargs.get("dividend_type", None)
+
+        # Unwrap serialized dataframe envelope if present
+        is_serialized = isinstance(result, dict) and result.get("__type__") == "dataframe"
+
+        if is_serialized:
+            # Result is a single serialized dataframe — not per-symbol dict; skip supplement
+            return result
+
+        if not isinstance(result, dict):
+            return result
+
+        changed = False
+        for xt_symbol in stock_list:
+            symbol_data = result.get(xt_symbol)
+            if symbol_data is None:
+                qmt_rows: list = []
+            elif hasattr(symbol_data, "to_dict"):
+                qmt_rows = symbol_data.to_dict("records")
+            elif isinstance(symbol_data, dict) and symbol_data.get("__type__") == "dataframe":
+                # serialized dataframe — reconstruct rows
+                inner = symbol_data.get("data", {})
+                columns = inner.get("columns", [])
+                data_lists = inner.get("data", [])
+                if columns and data_lists:
+                    qmt_rows = [dict(zip(columns, row)) for row in data_lists]
+                else:
+                    qmt_rows = []
+            elif isinstance(symbol_data, list):
+                qmt_rows = symbol_data
+            else:
+                continue
+
+            supplemented = self._supplement_from_csv(
+                xt_symbol, qmt_rows, start_time, end_time, "market", dividend_type=dividend_type
+            )
+            if supplemented is not qmt_rows and len(supplemented) != len(qmt_rows):
+                result[xt_symbol] = supplemented
+                changed = True
+
+        if changed:
+            self.log_info("rpc", "csv supplement applied", period=period, symbols=len(stock_list))
+
         return result
 
     def initialize_market_data(self) -> None:
@@ -540,12 +603,12 @@ class XtQuantBridge:
 
         # 3. For daily bars, supplement any missing dates from the CSV data source
         if self.csv_source is not None and xt_interval == "1d":
+            before = len(rows)
             rows = self._supplement_from_csv(xt_symbol, rows, start_time, end_time, source)
             if not rows:
                 source = "csv"
-            elif source != "csv":
-                # rows may have been partially filled from csv; keep source label if all came from QMT
-                pass
+            elif len(rows) > before:
+                source = f"{source}+csv"
 
         bars = [self.translator.translate_bar(xt_symbol, row, req.interval) for row in rows]
         self.log_info(
@@ -567,14 +630,26 @@ class XtQuantBridge:
         start_time: str,
         end_time: str,
         current_source: str,
+        dividend_type: str | None = None,
     ) -> list:
         """Merge *qmt_rows* with CSV rows, filling gaps that QMT did not return."""
-        csv_rows = self.csv_source.query(xt_symbol, start_time, end_time)
+        csv_path = self.csv_source.csv_path_for(xt_symbol, adjust_type=dividend_type)
+        self.log_info(
+            "history",
+            "csv check",
+            xt_symbol=xt_symbol,
+            path=csv_path,
+            qmt_rows=len(qmt_rows),
+            start=start_time,
+            end=end_time,
+        )
+        csv_rows = self.csv_source.query(xt_symbol, start_time, end_time, adjust_type=dividend_type)
         if not csv_rows:
+            self.log_info("history", "csv no data", xt_symbol=xt_symbol, path=csv_path)
             return qmt_rows
 
         if not qmt_rows:
-            self.log_info("history", "csv fallback used", xt_symbol=xt_symbol, csv_rows=len(csv_rows))
+            self.log_info("history", "csv fallback used", xt_symbol=xt_symbol, csv_rows=len(csv_rows), path=csv_path)
             return csv_rows
 
         # Build a set of dates already covered by QMT data

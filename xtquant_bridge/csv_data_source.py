@@ -8,12 +8,16 @@ from typing import Any
 from .utils import CHINA_TZ
 
 # Maps user-facing adjust type names / codes to CSV folder names
+# QMT dividend_type values: "front" = 前复权, "back" = 后复权, "none" / "" = 不复权
 _ADJUST_FOLDER: dict[Any, str] = {
     "前复权": "前复权",
     "不复权": "不复权",
     "后复权": "后复权",
+    "front": "前复权",    # QMT dividend_type
+    "back": "后复权",     # QMT dividend_type
+    "none": "不复权",     # QMT dividend_type
+    "": "不复权",
     "forward": "前复权",
-    "none": "不复权",
     "backward": "后复权",
     "qfq": "前复权",
     "hfq": "后复权",
@@ -46,6 +50,10 @@ class CsvDataSource:
         code = xt_symbol.split(".")[0]
         return os.path.join(self.base_path, folder, f"{code}.csv")
 
+    def csv_path_for(self, xt_symbol: str, adjust_type: str | None = None) -> str:
+        adjust = adjust_type if adjust_type is not None else self.default_adjust
+        return self._csv_path(xt_symbol, adjust)
+
     def query(
         self,
         xt_symbol: str,
@@ -57,6 +65,8 @@ class CsvDataSource:
 
         *start_time* and *end_time* are QMT-style strings ``YYYYMMDDHHMMSS``
         (or ``YYYYMMDD``, or empty for unbounded).
+        Returns ``(rows, csv_path)`` where *csv_path* is the file that was read
+        (or would have been read if it existed).
         """
         adjust = adjust_type if adjust_type is not None else self.default_adjust
         csv_path = self._csv_path(xt_symbol, adjust)

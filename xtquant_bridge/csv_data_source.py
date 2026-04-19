@@ -46,11 +46,14 @@ class CsvDataSource:
         xt_symbol: str,
         period: str = "1d",
         adjust_type: str | None = None,
+        start_time: str = "",
+        end_time: str = "",
     ) -> str:
         """Return the primary CSV path for *xt_symbol* (may not exist)."""
         code = _code_from_xt(xt_symbol)
         if period in _MINUTE_PERIODS:
-            return os.path.join(self.base_path, "1min", _MIN_ONLY_ADJUST, "<year>", f"{code}.csv")
+            paths = self._minute_csv_paths(xt_symbol, start_time, end_time)
+            return " | ".join(paths)
 
         adjust = _ADJUST_FOLDER.get(adjust_type, self.default_adjust) if adjust_type is not None else self.default_adjust
         return os.path.join(self.base_path, "1day", adjust, f"{code}.csv")
@@ -123,23 +126,28 @@ class CsvDataSource:
         start_time: str,
         end_time: str,
     ) -> list[dict[str, Any]]:
-        code = _code_from_xt(xt_symbol)
         start_dt = _parse_qmt_datetime(start_time)
         end_dt = _parse_qmt_datetime(end_time)
 
-        start_year = start_dt.year if start_dt else 2000
-        end_year = end_dt.year if end_dt else datetime.now(CHINA_TZ).year
-
         rows: list[dict[str, Any]] = []
-        base_min = os.path.join(self.base_path, "1min", _MIN_ONLY_ADJUST)
-
-        for year in range(start_year, end_year + 1):
-            csv_path = os.path.join(base_min, str(year), f"{code}.csv")
+        for csv_path in self._minute_csv_paths(xt_symbol, start_time, end_time):
             if not os.path.isfile(csv_path):
                 continue
             rows.extend(_read_minute_csv(csv_path, start_dt, end_dt))
 
         return rows
+
+    def _minute_csv_paths(self, xt_symbol: str, start_time: str, end_time: str) -> list[str]:
+        code = _code_from_xt(xt_symbol)
+        start_dt = _parse_qmt_datetime(start_time)
+        end_dt = _parse_qmt_datetime(end_time)
+        start_year = start_dt.year if start_dt else datetime.now(CHINA_TZ).year
+        end_year = end_dt.year if end_dt else start_year
+        if end_year < start_year:
+            end_year = start_year
+
+        base_min = os.path.join(self.base_path, "1min", _MIN_ONLY_ADJUST)
+        return [os.path.join(base_min, str(year), f"{code}.csv") for year in range(start_year, end_year + 1)]
 
 
 def _read_minute_csv(

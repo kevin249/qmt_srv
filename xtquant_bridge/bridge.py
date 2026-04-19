@@ -23,6 +23,7 @@ from .utils import (
     format_history_time,
     map_vnpy_interval_to_xt,
     normalize_qmt_root_path,
+    parse_xt_timestamp,
     resolve_userdata_path,
     vnpy_symbol_to_xt,
 )
@@ -124,6 +125,50 @@ class XtQuantBridge:
     @staticmethod
     def _safe_attr(data: Any, name: str, default: Any = "") -> Any:
         return getattr(data, name, default)
+
+    @staticmethod
+    def _extract_history_rows(result: Any, xt_symbol: str) -> list:
+        if not result:
+            return []
+        symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
+        if hasattr(symbol_data, "to_dict"):
+            return symbol_data.to_dict("records")
+        if isinstance(symbol_data, list):
+            return symbol_data
+        return []
+
+    @staticmethod
+    def _format_history_range(rows: list) -> str:
+        datetimes = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            dt = parse_xt_timestamp(row.get("time") or row.get("timestamp"))
+            if dt is not None:
+                datetimes.append(dt.astimezone(CHINA_TZ))
+        if not datetimes:
+            return "-"
+        datetimes.sort()
+        return f"{datetimes[0].strftime('%Y-%m-%d %H:%M:%S')}~{datetimes[-1].strftime('%Y-%m-%d %H:%M:%S')}"
+
+    def _print_history_summary(
+        self,
+        vt_symbol: str,
+        interval: str,
+        source: str,
+        local_rows: list,
+        market_rows: list,
+        csv_rows: list,
+        final_rows: list,
+    ) -> None:
+        lines = [
+            f"[XTQ Bridge] [INFO][history] 最终历史数据汇总 vt_symbol={vt_symbol} interval={interval} source={source} ...",
+            f"[XTQ Bridge] [INFO][history] local_count={len(local_rows)} local_range={self._format_history_range(local_rows)} ...",
+            f"[XTQ Bridge] [INFO][history] market_count={len(market_rows)} market_range={self._format_history_range(market_rows)} ...",
+            f"[XTQ Bridge] [INFO][history] csv_count={len(csv_rows)} csv_range={self._format_history_range(csv_rows)} ...",
+            f"[XTQ Bridge] [INFO][history] final_count={len(final_rows)} final_range={self._format_history_range(final_rows)} ...",
+        ]
+        print("\n".join(lines))
 
     def should_log(self, level: str, category: str) -> bool:
         if not self.logging_config.get("enabled", True):
@@ -740,6 +785,9 @@ class XtQuantBridge:
         }
         source = "market"
         rows: list = []
+        local_rows: list = []
+        market_rows: list = []
+        csv_stats: dict[str, list] = {"rows": []}
 
         download_args = ([xt_symbol], xt_interval, start_time, end_time)
         if hasattr(self.xtdata, "download_history_data2"):
@@ -770,23 +818,19 @@ class XtQuantBridge:
                 f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
             )
             result = self.xtdata.get_local_data(**query_kwargs)
-            if result:
-                symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
-                if hasattr(symbol_data, "to_dict"):
-                    rows = symbol_data.to_dict("records")
-                elif isinstance(symbol_data, list):
-                    rows = symbol_data
-                if rows:
-                    source = "local"
-                    print(
-                        f"[XTQ Bridge] [INFO][history] MiniQMT 本地缓存读取完成 "
-                        f"vt_symbol={req.vt_symbol} interval={xt_interval} count={len(rows)} ..."
-                    )
-                else:
-                    print(
-                        f"[XTQ Bridge] [WARN][history] MiniQMT 本地缓存无数据 "
-                        f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} count=0 ..."
-                    )
+            local_rows = self._extract_history_rows(result, xt_symbol)
+            if local_rows:
+                rows = list(local_rows)
+                source = "local"
+                print(
+                    f"[XTQ Bridge] [INFO][history] MiniQMT 本地缓存读取完成 "
+                    f"vt_symbol={req.vt_symbol} interval={xt_interval} count={len(rows)} ..."
+                )
+            else:
+                print(
+                    f"[XTQ Bridge] [WARN][history] MiniQMT 本地缓存无数据 "
+                    f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} count=0 ..."
+                )
 
         # 2. If local cache is empty, try QMT market data
         if not rows:
@@ -795,12 +839,9 @@ class XtQuantBridge:
                 f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
             )
             result = self.xtdata.get_market_data_ex(**query_kwargs)
-            symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
-            if hasattr(symbol_data, "to_dict"):
-                rows = symbol_data.to_dict("records")
-            elif isinstance(symbol_data, list):
-                rows = symbol_data
-            if rows:
+            market_rows = self._extract_history_rows(result, xt_symbol)
+            if market_rows:
+                rows = list(market_rows)
                 source = "market"
                 print(
                     f"[XTQ Bridge] [INFO][history] MiniQMT 行情接口读取完成 "
@@ -821,7 +862,7 @@ class XtQuantBridge:
             )
             rows = self._supplement_from_csv(
                 xt_symbol, rows, start_time, end_time, source,
-                period=xt_interval, dividend_type=None,
+                period=xt_interval, dividend_type=None, stats=csv_stats,
             )
             if not rows:
                 source = "csv"
@@ -833,6 +874,15 @@ class XtQuantBridge:
                 f"vt_symbol={req.vt_symbol} interval={xt_interval} start={start_time} end={end_time} ..."
             )
 
+        self._print_history_summary(
+            req.vt_symbol,
+            xt_interval,
+            source,
+            local_rows,
+            market_rows,
+            csv_stats.get("rows", []),
+            rows,
+        )
         bars = [self.translator.translate_bar(xt_symbol, row, req.interval) for row in rows]
         self.log_info(
             "history",
@@ -855,9 +905,16 @@ class XtQuantBridge:
         current_source: str,
         period: str = "1d",
         dividend_type: str | None = None,
+        stats: dict[str, Any] | None = None,
     ) -> list:
         """Merge *qmt_rows* with CSV rows, filling gaps that QMT did not return."""
-        csv_path = self.csv_source.csv_path_for(xt_symbol, period=period, adjust_type=dividend_type)
+        csv_path = self.csv_source.csv_path_for(
+            xt_symbol,
+            period=period,
+            adjust_type=dividend_type,
+            start_time=start_time,
+            end_time=end_time,
+        )
         self.log_info(
             "history",
             "csv check",
@@ -871,6 +928,8 @@ class XtQuantBridge:
         csv_rows = self.csv_source.query(
             xt_symbol, start_time, end_time, period=period, adjust_type=dividend_type
         )
+        if stats is not None:
+            stats["rows"] = list(csv_rows)
         if not csv_rows:
             print(
                 f"[XTQ Bridge] [WARN][history] CSV 回退失败 xt_symbol={xt_symbol} "

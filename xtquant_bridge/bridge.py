@@ -502,9 +502,10 @@ class XtQuantBridge:
     def _csv_supplement_xtdata_result(self, result: Any, kwargs: dict) -> Any:
         """Post-process a get_market_data_ex / get_local_data result and fill gaps from CSV.
 
-        The CSV source only contains daily bars.  For any period (including 1m/1h),
-        dates that QMT did not return at all are filled with the corresponding daily
-        bar from CSV so the caller at least has OHLCV coverage for those days.
+        Dates that QMT did not return at all are filled from CSV so the caller
+        has OHLCV coverage for those bars.  The supplemented data is re-serialised
+        back to the same ``{"__type__": "dataframe", ...}`` envelope the client
+        expects, so it is handled identically to pure-QMT results.
         """
         stock_list = kwargs.get("stock_list") or []
         start_time = str(kwargs.get("start_time") or "")
@@ -522,15 +523,17 @@ class XtQuantBridge:
         changed = False
         for xt_symbol in stock_list:
             symbol_data = result.get(xt_symbol)
+            orig_columns: list[str] | None = None
+
             if symbol_data is None:
                 qmt_rows: list = []
             elif hasattr(symbol_data, "to_dict"):
                 qmt_rows = symbol_data.to_dict("records")
             elif isinstance(symbol_data, dict) and symbol_data.get("__type__") == "dataframe":
                 inner = symbol_data.get("data", {})
-                columns = inner.get("columns", [])
+                orig_columns = inner.get("columns") or []
                 data_lists = inner.get("data", [])
-                qmt_rows = [dict(zip(columns, row)) for row in data_lists] if columns and data_lists else []
+                qmt_rows = [dict(zip(orig_columns, row)) for row in data_lists] if orig_columns and data_lists else []
             elif isinstance(symbol_data, list):
                 qmt_rows = symbol_data
             else:
@@ -541,7 +544,31 @@ class XtQuantBridge:
                 period=period, dividend_type=dividend_type,
             )
             if len(supplemented) != len(qmt_rows):
-                result[xt_symbol] = supplemented
+                # Re-serialise back to the DataFrame envelope the client expects.
+                # CSV rows carry datetime objects for 'time'; normalise to unix-ms
+                # integers to match the QMT format.
+                columns = orig_columns or (list(qmt_rows[0].keys()) if qmt_rows else
+                                           ["time", "open", "high", "low", "close", "volume", "amount"])
+
+                def _norm_time(t: Any) -> Any:
+                    if hasattr(t, "timestamp"):
+                        return int(t.timestamp() * 1000)
+                    return t
+
+                rows_data = [
+                    [_norm_time(row["time"]) if col == "time" else row.get(col)
+                     for col in columns]
+                    for row in supplemented
+                ]
+                result[xt_symbol] = {
+                    "__type__": "dataframe",
+                    "orient": "split",
+                    "data": {
+                        "index": list(range(len(rows_data))),
+                        "columns": columns,
+                        "data": rows_data,
+                    },
+                }
                 changed = True
 
         if changed:
@@ -964,20 +991,41 @@ class XtQuantBridge:
             self.log_info("history", "csv fallback used", xt_symbol=xt_symbol, csv_rows=len(csv_rows), path=csv_path)
             return csv_rows
 
-        # Build a set of calendar dates already covered by QMT data.
+        # Determine QMT's earliest timestamp so we can use CSV only for the
+        # period BEFORE QMT data begins (prioritise newest data from QMT).
         # QMT rows may carry 'time' as a datetime, a 14-digit int (YYYYMMDDHHMMSS),
-        # or a unix-ms integer — extract just the YYYY-MM-DD portion.
-        def _row_date(row) -> str:
+        # or a unix-ms integer.
+
+        def _row_unix_s(row) -> float:
+            """Return the row timestamp as unix seconds (float)."""
+            t = row.get("time")
+            if t is None:
+                return 0.0
+            if hasattr(t, "timestamp"):
+                return t.timestamp()
+            s = str(int(t))
+            if len(s) == 14:
+                from datetime import datetime as _dt
+                try:
+                    return _dt.strptime(s, "%Y%m%d%H%M%S").replace(tzinfo=CHINA_TZ).timestamp()
+                except Exception:
+                    return 0.0
+            try:
+                ts = float(t)
+                return ts / 1000 if ts > 1_000_000_000_000 else ts
+            except Exception:
+                return 0.0
+
+        def _row_date_str(row) -> str:
+            """Return 'YYYY-MM-DD' for the row (used for the date-boundary cut)."""
             t = row.get("time")
             if t is None:
                 return ""
             if hasattr(t, "strftime"):
                 return t.strftime("%Y-%m-%d")
-            # QMT 14-digit int timestamp: YYYYMMDDHHMMSS
             s = str(int(t))
             if len(s) == 14:
                 return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
-            # unix-ms or unix-s integer
             try:
                 ts = float(t)
                 if ts > 1_000_000_000_000:
@@ -987,16 +1035,22 @@ class XtQuantBridge:
             except Exception:
                 return ""
 
-        qmt_dates = {_row_date(r) for r in qmt_rows}
-        qmt_dates.discard("")
+        # Use QMT's earliest date as the cut-off: CSV fills everything strictly
+        # before that date (date-level boundary avoids partial-day overlaps).
+        qmt_min_date = min((_row_date_str(r) for r in qmt_rows), default="")
+        if qmt_min_date:
+            missing = [r for r in csv_rows if r["time"].strftime("%Y-%m-%d") < qmt_min_date]
+        else:
+            # No QMT data at all — use full CSV range (already handled above,
+            # but guard against edge cases).
+            missing = list(csv_rows)
 
-        missing = [r for r in csv_rows if r["time"].strftime("%Y-%m-%d") not in qmt_dates]
         if not missing:
             return qmt_rows
 
         print(
             f"[XTQ Bridge] [INFO][history] CSV 补齐缺失数据 xt_symbol={xt_symbol} "
-            f"period={period} missing={len(missing)} path={csv_path} ..."
+            f"period={period} missing={len(missing)} qmt_from={qmt_min_date} path={csv_path} ..."
         )
         self.log_info(
             "history",
@@ -1004,9 +1058,12 @@ class XtQuantBridge:
             xt_symbol=xt_symbol,
             qmt_rows=len(qmt_rows),
             missing_from_csv=len(missing),
+            qmt_earliest=qmt_min_date,
         )
-        combined = qmt_rows + missing
-        combined.sort(key=lambda r: _row_date(r))
+        # CSV rows come first (older), QMT rows follow (newer); sort by full
+        # timestamp so minute bars within each day are correctly ordered.
+        combined = missing + qmt_rows
+        combined.sort(key=_row_unix_s)
         return combined
 
     def register_client(self, client_name: str, client_meta: dict[str, Any] | None = None) -> bool:

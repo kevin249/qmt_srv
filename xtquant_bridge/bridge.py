@@ -960,44 +960,8 @@ class XtQuantBridge:
             start_time=start_time,
             end_time=end_time,
         )
-        self.log_info(
-            "history",
-            "csv check",
-            xt_symbol=xt_symbol,
-            period=period,
-            path=csv_path,
-            qmt_rows=len(qmt_rows),
-            start=start_time,
-            end=end_time,
-        )
-        csv_rows = self.csv_source.query(
-            xt_symbol, start_time, end_time, period=period, adjust_type=dividend_type
-        )
-        if stats is not None:
-            stats["rows"] = list(csv_rows)
-        if not csv_rows:
-            print(
-                f"[XTQ Bridge] [WARN][history] CSV 回退失败 xt_symbol={xt_symbol} "
-                f"period={period} path={csv_path} count=0 ..."
-            )
-            self.log_info("history", "csv no data", xt_symbol=xt_symbol, path=csv_path)
-            return qmt_rows
-
-        if not qmt_rows:
-            print(
-                f"[XTQ Bridge] [WARN][history] MiniQMT 失败后改用 CSV 数据 xt_symbol={xt_symbol} "
-                f"period={period} csv_rows={len(csv_rows)} path={csv_path} ..."
-            )
-            self.log_info("history", "csv fallback used", xt_symbol=xt_symbol, csv_rows=len(csv_rows), path=csv_path)
-            return csv_rows
-
-        # Determine QMT's earliest timestamp so we can use CSV only for the
-        # period BEFORE QMT data begins (prioritise newest data from QMT).
-        # QMT rows may carry 'time' as a datetime, a 14-digit int (YYYYMMDDHHMMSS),
-        # or a unix-ms integer.
-
+        # ── helper: convert any row 'time' field to unix seconds ────────────
         def _row_unix_s(row) -> float:
-            """Return the row timestamp as unix seconds (float)."""
             t = row.get("time")
             if t is None:
                 return 0.0
@@ -1017,7 +981,6 @@ class XtQuantBridge:
                 return 0.0
 
         def _row_date_str(row) -> str:
-            """Return 'YYYY-MM-DD' for the row (used for the date-boundary cut)."""
             t = row.get("time")
             if t is None:
                 return ""
@@ -1035,30 +998,90 @@ class XtQuantBridge:
             except Exception:
                 return ""
 
-        # Use QMT's earliest date as the cut-off: CSV fills everything strictly
-        # before that date (date-level boundary avoids partial-day overlaps).
+        # ── log QMT date range before reading CSV ─────────────────────────
+        qmt_first = _row_date_str(qmt_rows[0]) if qmt_rows else ""
+        qmt_last  = _row_date_str(qmt_rows[-1]) if qmt_rows else ""
+        self.log_info(
+            "history",
+            "csv check",
+            xt_symbol=xt_symbol,
+            period=period,
+            path=csv_path,
+            qmt_rows=len(qmt_rows),
+            qmt_range=f"{qmt_first} ~ {qmt_last}" if qmt_first else "none",
+            requested=f"{start_time} ~ {end_time}",
+        )
+        print(
+            f"[XTQ Bridge] [INFO][history] csv check  xt_symbol={xt_symbol} period={period}"
+            f"  QMT={len(qmt_rows)}行 [{qmt_first} ~ {qmt_last}]"
+            f"  请求范围=[{start_time} ~ {end_time}]"
+            f"  path={csv_path}"
+        )
+
+        csv_rows = self.csv_source.query(
+            xt_symbol, start_time, end_time, period=period, adjust_type=dividend_type
+        )
+        if stats is not None:
+            stats["rows"] = list(csv_rows)
+
+        csv_first = csv_rows[0]["time"].strftime("%Y-%m-%d") if csv_rows else ""
+        csv_last  = csv_rows[-1]["time"].strftime("%Y-%m-%d") if csv_rows else ""
+
+        if not csv_rows:
+            print(
+                f"[XTQ Bridge] [WARN][history] CSV 回退失败 xt_symbol={xt_symbol} "
+                f"period={period} path={csv_path} count=0 ..."
+            )
+            self.log_info("history", "csv no data", xt_symbol=xt_symbol, path=csv_path)
+            return qmt_rows
+
+        if not qmt_rows:
+            print(
+                f"[XTQ Bridge] [WARN][history] MiniQMT 失败后改用 CSV 数据 xt_symbol={xt_symbol} "
+                f"period={period} csv_rows={len(csv_rows)} [{csv_first} ~ {csv_last}] path={csv_path} ..."
+            )
+            self.log_info("history", "csv fallback used", xt_symbol=xt_symbol,
+                          csv_rows=len(csv_rows), csv_range=f"{csv_first} ~ {csv_last}", path=csv_path)
+            return csv_rows
+
+        # ── use QMT's earliest date as the cut-off ────────────────────────
+        # CSV fills everything strictly before that date (date-level boundary
+        # avoids partial-day overlaps on the boundary day).
         qmt_min_date = min((_row_date_str(r) for r in qmt_rows), default="")
+        qmt_max_date = max((_row_date_str(r) for r in qmt_rows), default="")
         if qmt_min_date:
             missing = [r for r in csv_rows if r["time"].strftime("%Y-%m-%d") < qmt_min_date]
         else:
-            # No QMT data at all — use full CSV range (already handled above,
-            # but guard against edge cases).
             missing = list(csv_rows)
 
+        csv_used_first = missing[0]["time"].strftime("%Y-%m-%d") if missing else ""
+        csv_used_last  = missing[-1]["time"].strftime("%Y-%m-%d") if missing else ""
+
         if not missing:
+            print(
+                f"[XTQ Bridge] [INFO][history] CSV 无需补齐 xt_symbol={xt_symbol} period={period}"
+                f"  QMT=[{qmt_min_date} ~ {qmt_max_date}] CSV=[{csv_first} ~ {csv_last}] 已完全覆盖"
+            )
             return qmt_rows
 
+        # ── log per-source ranges before merging ─────────────────────────
         print(
-            f"[XTQ Bridge] [INFO][history] CSV 补齐缺失数据 xt_symbol={xt_symbol} "
-            f"period={period} missing={len(missing)} qmt_from={qmt_min_date} path={csv_path} ..."
+            f"[XTQ Bridge] [INFO][history] CSV 补齐缺失数据 xt_symbol={xt_symbol} period={period}\n"
+            f"[XTQ Bridge]   [1] QMT   : {len(qmt_rows):>7}行  [{qmt_min_date} ~ {qmt_max_date}]\n"
+            f"[XTQ Bridge]   [2] CSV补充: {len(missing):>7}行  [{csv_used_first} ~ {csv_used_last}]\n"
+            f"[XTQ Bridge]   [3] 合并后 : {len(qmt_rows) + len(missing):>7}行  "
+            f"[{min(csv_used_first, qmt_min_date)} ~ {qmt_max_date}]"
         )
         self.log_info(
             "history",
             "csv supplement",
             xt_symbol=xt_symbol,
             qmt_rows=len(qmt_rows),
+            qmt_range=f"{qmt_min_date} ~ {qmt_max_date}",
             missing_from_csv=len(missing),
-            qmt_earliest=qmt_min_date,
+            csv_range=f"{csv_used_first} ~ {csv_used_last}",
+            merged_total=len(qmt_rows) + len(missing),
+            merged_range=f"{min(csv_used_first, qmt_min_date)} ~ {qmt_max_date}",
         )
         # CSV rows come first (older), QMT rows follow (newer); sort by full
         # timestamp so minute bars within each day are correctly ordered.

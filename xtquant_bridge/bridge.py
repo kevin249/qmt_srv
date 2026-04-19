@@ -18,6 +18,7 @@ from .event_publisher import EventPublisher
 from .rpc_handler import RpcRequestHandler
 from .translator import DataTranslator
 from .utils import (
+    CHINA_TZ,
     GATEWAY_NAME,
     format_history_time,
     map_vnpy_interval_to_xt,
@@ -113,6 +114,10 @@ class XtQuantBridge:
         csv_path = str(csv_cfg.get("path") or "").strip()
         csv_adjust = str(csv_cfg.get("default_adjust") or "前复权")
         self.csv_source: CsvDataSource | None = CsvDataSource(csv_path, csv_adjust) if csv_path else None
+
+        # Track which symbols have had their financial data ensured this session
+        # to avoid redundant download_financial_data calls per symbol.
+        self._financial_data_ensured: set[str] = set()
 
     @staticmethod
     def _safe_attr(data: Any, name: str, default: Any = "") -> Any:
@@ -250,41 +255,178 @@ class XtQuantBridge:
                 self.log_info("rpc", "download progress", method=rpc_name, data=repr(data)[:200])
         return callback
 
+    _DATA_FETCH_METHODS = frozenset({"xtdata.get_market_data_ex", "xtdata.get_local_data"})
+
     def call_xtdata(self, rpc_name: str, *args, **kwargs):
-        arg_summary = repr(args)[:200] if args else ""
-        kwarg_summary = " ".join(f"{k}={repr(v)[:80]}" for k, v in kwargs.items()) if kwargs else ""
-        self.log_info("rpc", "xtdata rpc start", method=rpc_name, args=arg_summary, kwargs=kwarg_summary)
+        if rpc_name in self._DATA_FETCH_METHODS:
+            self._log_data_fetch_request(rpc_name, args, kwargs)
+        else:
+            arg_summary = repr(args)[:200] if args else ""
+            kwarg_summary = " ".join(f"{k}={repr(v)[:80]}" for k, v in kwargs.items()) if kwargs else ""
+            self.log_info("rpc", "xtdata rpc start", method=rpc_name, args=arg_summary, kwargs=kwarg_summary)
+
         if rpc_name in ("xtdata.download_history_data2", "xtdata.download_history_data") and "callback" not in kwargs:
             kwargs = {**kwargs, "callback": self._make_download_progress_callback(rpc_name)}
         result = self.xtdata_executor.call(rpc_name, *args, **kwargs)
-        self.log_info("rpc", "xtdata rpc done", method=rpc_name, result=self._summarize_xtdata_result(result))
 
-        if (
-            self.csv_source is not None
-            and rpc_name in ("xtdata.get_market_data_ex", "xtdata.get_local_data")
-        ):
+        if rpc_name in self._DATA_FETCH_METHODS:
+            self._log_data_fetch_result(rpc_name, result, kwargs)
+        else:
+            self.log_info("rpc", "xtdata rpc done", method=rpc_name, result=self._summarize_xtdata_result(result))
+
+        if self.csv_source is not None and rpc_name in self._DATA_FETCH_METHODS:
             result = self._csv_supplement_xtdata_result(result, kwargs)
 
         return result
 
-    def _csv_supplement_xtdata_result(self, result: Any, kwargs: dict) -> Any:
-        """Post-process a get_market_data_ex / get_local_data result and fill gaps from CSV."""
+    def _log_data_fetch_request(self, rpc_name: str, args: tuple, kwargs: dict) -> None:
         period = kwargs.get("period", "")
-        if period != "1d":
-            return result
+        dividend_type = kwargs.get("dividend_type", "")
+        stock_list = kwargs.get("stock_list") or (list(args[0]) if args else [])
+        start_time = kwargs.get("start_time", "")
+        end_time = kwargs.get("end_time", "")
+        count = kwargs.get("count", "")
+        fill_data = kwargs.get("fill_data", "")
+        field_list = kwargs.get("field_list") or []
 
+        period_label = {
+            "tick": "Tick", "1m": "分钟线(1m)", "5m": "分钟线(5m)", "15m": "分钟线(15m)",
+            "30m": "分钟线(30m)", "1h": "小时线(1h)", "1d": "日线(1d)", "1w": "周线(1w)",
+            "1mon": "月线(1mon)",
+        }.get(str(period), str(period))
+
+        adjust_label = {
+            "front": "前复权", "back": "后复权", "none": "不复权", "": "不复权(默认)",
+        }.get(str(dividend_type), str(dividend_type))
+
+        lines = [
+            f">>> MiniQMT 数据请求 [{rpc_name}]",
+            f"    股票列表  : {stock_list}",
+            f"    周期      : {period_label}",
+            f"    复权模式  : {adjust_label}",
+            f"    开始时间  : {start_time}",
+            f"    结束时间  : {end_time}",
+            f"    条数限制  : {count}",
+            f"    填充空值  : {fill_data}",
+            f"    字段列表  : {field_list}",
+        ]
+        print("[XTQ Bridge] " + "\n[XTQ Bridge] ".join(lines))
+
+        # ── 坑1：伪复权防护 ───────────────────────────────────────────────
+        # 若请求复权数据但本地缺少除权表，QMT 不报错，静默返回不复权原始数据。
+        # 在每次请求前确保财务数据已下载，避免回测/实盘中吃到除权跳空。
+        if str(dividend_type) in ("front", "back") and stock_list:
+            self._ensure_financial_data(stock_list)
+
+        # ── 坑2：量价不匹配警告 ──────────────────────────────────────────
+        # QMT 前/后复权只调整价格，部分版本不同步调整成交量，导致 amount 对不上。
+        # 若策略强依赖精确量价关系（如主力资金净流入），建议用 none + 手动复权。
+        if str(dividend_type) in ("front", "back") and "volume" in field_list:
+            print(
+                "[XTQ Bridge] [WARN][market_data] 量价不匹配风险："
+                " QMT 复权只调整价格(open/high/low/close)，"
+                "成交量(volume)在部分版本不按比例还原，"
+                "amount 可能与 price×volume 不一致。"
+                " 若策略强依赖量价关系，建议改用 dividend_type='none' + 手动复权。"
+            )
+
+    def _ensure_financial_data(self, stock_list: list[str]) -> None:
+        """下载缺失的财务除权数据，防止 QMT 静默返回伪复权数据。
+
+        QMT 行为：若本地无除权表，即使 dividend_type='front'/'back' 也不报错，
+        直接返回不复权原始数据，导致回测出现除权跳空（未来函数）。
+        """
+        missing = [s for s in stock_list if s not in self._financial_data_ensured]
+        if not missing:
+            return
+
+        if not hasattr(self.xtdata, "download_financial_data"):
+            print(
+                f"[XTQ Bridge] [WARN][market_data] 当前 xtquant 版本无 download_financial_data，"
+                f"无法自动补充除权表，复权数据可能不准确。股票: {missing}"
+            )
+            self._financial_data_ensured.update(missing)
+            return
+
+        print(
+            f"[XTQ Bridge] [INFO][market_data] 复权请求前自动补充财务除权数据"
+            f" (共 {len(missing)} 只): {missing}"
+        )
+        try:
+            self.xtdata.download_financial_data(missing)
+            self._financial_data_ensured.update(missing)
+            print(f"[XTQ Bridge] [INFO][market_data] 财务除权数据下载完成: {missing}")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[XTQ Bridge] [WARN][market_data] 财务除权数据下载失败: {exc}。"
+                f" 复权数据可能不准确，请在 QMT 客户端「数据管理」中手动补充除权表。"
+            )
+
+    def _log_data_fetch_result(self, rpc_name: str, result: Any, kwargs: dict) -> None:
+        period = kwargs.get("period", "")
+        stock_list = kwargs.get("stock_list") or []
+
+        if not isinstance(result, dict) or result.get("__type__") == "dataframe":
+            print(f"[XTQ Bridge] <<< MiniQMT 返回 [{rpc_name}]: {self._summarize_xtdata_result(result)}")
+            return
+
+        lines = [f"<<< MiniQMT 返回 [{rpc_name}]  周期={period}"]
+        for sym in stock_list:
+            val = result.get(sym)
+            if val is None:
+                lines.append(f"    {sym}: 无数据")
+                continue
+
+            if hasattr(val, "shape"):
+                # pandas DataFrame
+                rows, cols = val.shape
+                columns = list(val.columns)
+                first_time = last_time = ""
+                if "time" in val.columns and len(val) > 0:
+                    first_time = val["time"].iloc[0]
+                    last_time = val["time"].iloc[-1]
+                lines.append(
+                    f"    {sym}: DataFrame {rows}行 x {cols}列  "
+                    f"列={columns}  "
+                    f"首条time={first_time}  末条time={last_time}"
+                )
+            elif isinstance(val, dict) and val.get("__type__") == "dataframe":
+                inner = val.get("data", {})
+                columns = inner.get("columns", [])
+                data = inner.get("data", [])
+                rows = len(data)
+                first_time = data[0][columns.index("time")] if data and "time" in columns else ""
+                last_time = data[-1][columns.index("time")] if data and "time" in columns else ""
+                lines.append(
+                    f"    {sym}: DataFrame(序列化) {rows}行  "
+                    f"列={columns}  "
+                    f"首条time={first_time}  末条time={last_time}"
+                )
+            elif isinstance(val, list):
+                rows = len(val)
+                first_time = val[0].get("time", "") if rows > 0 and isinstance(val[0], dict) else ""
+                last_time = val[-1].get("time", "") if rows > 0 and isinstance(val[-1], dict) else ""
+                lines.append(f"    {sym}: list {rows}条  首条time={first_time}  末条time={last_time}")
+            else:
+                lines.append(f"    {sym}: {type(val).__name__} {repr(val)[:120]}")
+
+        print("[XTQ Bridge] " + "\n[XTQ Bridge] ".join(lines))
+
+    def _csv_supplement_xtdata_result(self, result: Any, kwargs: dict) -> Any:
+        """Post-process a get_market_data_ex / get_local_data result and fill gaps from CSV.
+
+        The CSV source only contains daily bars.  For any period (including 1m/1h),
+        dates that QMT did not return at all are filled with the corresponding daily
+        bar from CSV so the caller at least has OHLCV coverage for those days.
+        """
         stock_list = kwargs.get("stock_list") or []
         start_time = str(kwargs.get("start_time") or "")
         end_time = str(kwargs.get("end_time") or "")
-
-        # Determine adjust type from dividend_type kwarg if present
+        period = str(kwargs.get("period") or "")
         dividend_type = kwargs.get("dividend_type", None)
 
-        # Unwrap serialized dataframe envelope if present
-        is_serialized = isinstance(result, dict) and result.get("__type__") == "dataframe"
-
-        if is_serialized:
-            # Result is a single serialized dataframe — not per-symbol dict; skip supplement
+        # Single serialized dataframe envelope — not a per-symbol dict; skip.
+        if isinstance(result, dict) and result.get("__type__") == "dataframe":
             return result
 
         if not isinstance(result, dict):
@@ -298,23 +440,20 @@ class XtQuantBridge:
             elif hasattr(symbol_data, "to_dict"):
                 qmt_rows = symbol_data.to_dict("records")
             elif isinstance(symbol_data, dict) and symbol_data.get("__type__") == "dataframe":
-                # serialized dataframe — reconstruct rows
                 inner = symbol_data.get("data", {})
                 columns = inner.get("columns", [])
                 data_lists = inner.get("data", [])
-                if columns and data_lists:
-                    qmt_rows = [dict(zip(columns, row)) for row in data_lists]
-                else:
-                    qmt_rows = []
+                qmt_rows = [dict(zip(columns, row)) for row in data_lists] if columns and data_lists else []
             elif isinstance(symbol_data, list):
                 qmt_rows = symbol_data
             else:
                 continue
 
             supplemented = self._supplement_from_csv(
-                xt_symbol, qmt_rows, start_time, end_time, "market", dividend_type=dividend_type
+                xt_symbol, qmt_rows, start_time, end_time, "market",
+                period=period, dividend_type=dividend_type,
             )
-            if supplemented is not qmt_rows and len(supplemented) != len(qmt_rows):
+            if len(supplemented) != len(qmt_rows):
                 result[xt_symbol] = supplemented
                 changed = True
 
@@ -601,10 +740,13 @@ class XtQuantBridge:
             if rows:
                 source = "market"
 
-        # 3. For daily bars, supplement any missing dates from the CSV data source
-        if self.csv_source is not None and xt_interval == "1d":
+        # 3. Supplement any missing bars from the CSV data source
+        if self.csv_source is not None:
             before = len(rows)
-            rows = self._supplement_from_csv(xt_symbol, rows, start_time, end_time, source)
+            rows = self._supplement_from_csv(
+                xt_symbol, rows, start_time, end_time, source,
+                period=xt_interval, dividend_type=None,
+            )
             if not rows:
                 source = "csv"
             elif len(rows) > before:
@@ -630,20 +772,24 @@ class XtQuantBridge:
         start_time: str,
         end_time: str,
         current_source: str,
+        period: str = "1d",
         dividend_type: str | None = None,
     ) -> list:
         """Merge *qmt_rows* with CSV rows, filling gaps that QMT did not return."""
-        csv_path = self.csv_source.csv_path_for(xt_symbol, adjust_type=dividend_type)
+        csv_path = self.csv_source.csv_path_for(xt_symbol, period=period, adjust_type=dividend_type)
         self.log_info(
             "history",
             "csv check",
             xt_symbol=xt_symbol,
+            period=period,
             path=csv_path,
             qmt_rows=len(qmt_rows),
             start=start_time,
             end=end_time,
         )
-        csv_rows = self.csv_source.query(xt_symbol, start_time, end_time, adjust_type=dividend_type)
+        csv_rows = self.csv_source.query(
+            xt_symbol, start_time, end_time, period=period, adjust_type=dividend_type
+        )
         if not csv_rows:
             self.log_info("history", "csv no data", xt_symbol=xt_symbol, path=csv_path)
             return qmt_rows
@@ -652,16 +798,31 @@ class XtQuantBridge:
             self.log_info("history", "csv fallback used", xt_symbol=xt_symbol, csv_rows=len(csv_rows), path=csv_path)
             return csv_rows
 
-        # Build a set of dates already covered by QMT data
+        # Build a set of calendar dates already covered by QMT data.
+        # QMT rows may carry 'time' as a datetime, a 14-digit int (YYYYMMDDHHMMSS),
+        # or a unix-ms integer — extract just the YYYY-MM-DD portion.
         def _row_date(row) -> str:
             t = row.get("time")
             if t is None:
                 return ""
             if hasattr(t, "strftime"):
                 return t.strftime("%Y-%m-%d")
-            return str(t)[:10]
+            # QMT 14-digit int timestamp: YYYYMMDDHHMMSS
+            s = str(int(t))
+            if len(s) == 14:
+                return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+            # unix-ms or unix-s integer
+            try:
+                ts = float(t)
+                if ts > 1_000_000_000_000:
+                    ts /= 1000
+                from datetime import datetime as _dt
+                return _dt.fromtimestamp(ts, CHINA_TZ).strftime("%Y-%m-%d")
+            except Exception:
+                return ""
 
         qmt_dates = {_row_date(r) for r in qmt_rows}
+        qmt_dates.discard("")
 
         missing = [r for r in csv_rows if r["time"].strftime("%Y-%m-%d") not in qmt_dates]
         if not missing:

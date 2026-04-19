@@ -265,7 +265,7 @@ class XtQuantBridge:
         else:
             arg_summary = repr(args)[:200] if args else ""
             kwarg_summary = " ".join(f"{k}={repr(v)[:80]}" for k, v in kwargs.items()) if kwargs else ""
-            self.log_info("rpc", "xtdata rpc start", method=rpc_name, args=arg_summary, kwargs=kwarg_summary)
+            self.log_info("rpc", "xtdata rpc start ...", method=rpc_name, args=arg_summary, kwargs=kwarg_summary)
 
         if rpc_name in ("xtdata.download_history_data2", "xtdata.download_history_data") and "callback" not in kwargs:
             kwargs = {**kwargs, "callback": self._make_download_progress_callback(rpc_name)}
@@ -274,7 +274,7 @@ class XtQuantBridge:
         if rpc_name in self._DATA_FETCH_METHODS:
             self._log_data_fetch_result(rpc_name, result, kwargs)
         else:
-            self.log_info("rpc", "xtdata rpc done", method=rpc_name, result=self._summarize_xtdata_result(result))
+            self.log_info("rpc", "xtdata rpc done ...", method=rpc_name, result=self._summarize_xtdata_result(result))
 
         if self.csv_source is not None and rpc_name in self._DATA_FETCH_METHODS:
             result = self._csv_supplement_xtdata_result(result, kwargs)
@@ -302,7 +302,7 @@ class XtQuantBridge:
         }.get(str(dividend_type), str(dividend_type))
 
         lines = [
-            f">>> MiniQMT 数据请求 [{rpc_name}]",
+            f">>> MiniQMT 数据请求 [{rpc_name}] ...",
             f"    股票列表  : {stock_list}",
             f"    周期      : {period_label}",
             f"    复权模式  : {adjust_label}",
@@ -342,26 +342,48 @@ class XtQuantBridge:
         if not missing:
             return
 
+        if hasattr(self.xtdata, "download_financial_data2"):
+            print(
+                f"[XTQ Bridge] [INFO][market_data] 复权请求前自动补充财务除权数据"
+                f" (共 {len(missing)} 只): {missing} ..."
+            )
+            try:
+                self.xtdata.download_financial_data2(
+                    missing,
+                    callback=self._make_download_progress_callback("xtdata.download_financial_data2"),
+                )
+                self._financial_data_ensured.update(missing)
+                print(
+                    f"[XTQ Bridge] [INFO][market_data] 财务除权数据下载已发起"
+                    f" symbols={missing} mode=async ..."
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[XTQ Bridge] [WARN][market_data] 财务除权数据下载失败"
+                    f" symbols={missing} error={exc} ..."
+                )
+            return
+
         if not hasattr(self.xtdata, "download_financial_data"):
             print(
                 f"[XTQ Bridge] [WARN][market_data] 当前 xtquant 版本无 download_financial_data，"
-                f"无法自动补充除权表，复权数据可能不准确。股票: {missing}"
+                f"无法自动补充除权表，复权数据可能不准确。股票: {missing} ..."
             )
             self._financial_data_ensured.update(missing)
             return
 
         print(
-            f"[XTQ Bridge] [INFO][market_data] 复权请求前自动补充财务除权数据"
-            f" (共 {len(missing)} 只): {missing}"
+            f"[XTQ Bridge] [WARN][market_data] 当前仅支持阻塞版财务除权下载，"
+            f"可能导致 MiniQMT 卡住。股票: {missing} ..."
         )
         try:
             self.xtdata.download_financial_data(missing)
             self._financial_data_ensured.update(missing)
-            print(f"[XTQ Bridge] [INFO][market_data] 财务除权数据下载完成: {missing}")
+            print(f"[XTQ Bridge] [INFO][market_data] 财务除权数据下载完成: {missing} ...")
         except Exception as exc:  # noqa: BLE001
             print(
                 f"[XTQ Bridge] [WARN][market_data] 财务除权数据下载失败: {exc}。"
-                f" 复权数据可能不准确，请在 QMT 客户端「数据管理」中手动补充除权表。"
+                f" 复权数据可能不准确，请在 QMT 客户端「数据管理」中手动补充除权表。..."
             )
 
     def _log_data_fetch_result(self, rpc_name: str, result: Any, kwargs: dict) -> None:
@@ -369,10 +391,10 @@ class XtQuantBridge:
         stock_list = kwargs.get("stock_list") or []
 
         if not isinstance(result, dict) or result.get("__type__") == "dataframe":
-            print(f"[XTQ Bridge] <<< MiniQMT 返回 [{rpc_name}]: {self._summarize_xtdata_result(result)}")
+            print(f"[XTQ Bridge] <<< MiniQMT 返回 [{rpc_name}]: {self._summarize_xtdata_result(result)} ...")
             return
 
-        lines = [f"<<< MiniQMT 返回 [{rpc_name}]  周期={period}"]
+        lines = [f"<<< MiniQMT 返回 [{rpc_name}]  周期={period} ..."]
         for sym in stock_list:
             val = result.get(sym)
             if val is None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from datetime import date, datetime
 from itertools import count
 from typing import Any
 
@@ -8,7 +10,7 @@ from xtquant.xttrader import XtQuantTrader
 from xtquant.xttype import StockAccount
 from vnpy.event import Event
 from vnpy.rpc import RpcServer
-from vnpy.trader.constant import Interval
+from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK, EVENT_TRADE
 from vnpy.trader.object import LogData, OrderRequest
 
@@ -56,6 +58,7 @@ class XtQuantBridge:
             "history": False,
             "contract": False,
             "heartbeat": False,
+            "data_download": True,
         },
     }
 
@@ -73,6 +76,7 @@ class XtQuantBridge:
         self.config = config
         self.xt_config = config["xt"]
         self.rpc_config = config["rpc"]
+        self.data_download_config = config.get("data_download", {}) or {}
 
         self.rpc_server = rpc_server or RpcServer()
         self.xtdata = xtdata_module
@@ -106,6 +110,7 @@ class XtQuantBridge:
         self.local_order_sysid_map: dict[str, str] = {}
 
         self.ticks: dict[str, Any] = {}
+        self.l1_ticks: dict[str, dict[str, Any]] = {}
         self.orders: dict[str, Any] = {}
         self.trades: dict[str, Any] = {}
         self.positions: dict[str, Any] = {}
@@ -122,6 +127,11 @@ class XtQuantBridge:
         # Track which symbols have had their financial data ensured this session
         # to avoid redundant download_financial_data calls per symbol.
         self._financial_data_ensured: set[str] = set()
+        self._daily_1min_downloaded_dates: set[str] = set()
+        self._daily_1min_checked_non_trading_dates: set[str] = set()
+        self._data_download_stop = threading.Event()
+        self._data_download_thread: threading.Thread | None = None
+        self._data_download_lock = threading.Lock()
 
     @staticmethod
     def _safe_attr(data: Any, name: str, default: Any = "") -> Any:
@@ -230,16 +240,21 @@ class XtQuantBridge:
         self.rpc_server.start(self.rpc_config["rep_address"], self.rpc_config["pub_address"])
         self.publisher.start()
         self.running = True
+        self._data_download_stop.clear()
 
         try:
             self.initialize_market_data()
             self.initialize_trading()
             self.refresh_snapshots()
+            self.run_boot_data_download_if_enabled()
+            self.start_daily_1min_download_scheduler()
         except Exception:
             self.close()
             raise
 
     def close(self) -> None:
+        self.stop_daily_1min_download_scheduler()
+
         if self.xt_trader is not None:
             try:
                 self.xt_trader.stop()
@@ -258,6 +273,323 @@ class XtQuantBridge:
         self.rpc_server.join()
         self.running = False
 
+    @staticmethod
+    def _config_flag_enabled(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        try:
+            return int(value or 0) != 0
+        except (TypeError, ValueError):
+            return str(value).strip().lower() in {"true", "yes", "on"}
+
+    @staticmethod
+    def _normalize_download_day(value: Any, *, end_of_day: bool) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        digits = "".join(char for char in raw if char.isdigit())
+        if len(digits) == 8:
+            return f"{digits}{'235959' if end_of_day else '000000'}"
+        if len(digits) == 14:
+            return digits
+        raise ValueError(f"invalid download day: {value!r}; expected YYYYMMDD or YYYY-MM-DD")
+
+    def _data_download_dividend_type(self) -> str:
+        raw = str(
+            self.data_download_config.get(
+                "dividend_type",
+                self.data_download_config.get(
+                    "download_mode",
+                    self.data_download_config.get("mode", "front"),
+                ),
+            )
+            or "front"
+        ).strip()
+        aliases = {
+            "前复权": "front",
+            "qfq": "front",
+            "forward": "front",
+            "后复权": "back",
+            "hfq": "back",
+            "backward": "back",
+            "不复权": "none",
+            "none": "none",
+            "raw": "none",
+            "front": "front",
+            "back": "back",
+            "front_ratio": "front_ratio",
+            "back_ratio": "back_ratio",
+        }
+        normalized = aliases.get(raw.lower(), aliases.get(raw, raw))
+        if normalized not in {"none", "front", "back", "front_ratio", "back_ratio"}:
+            raise ValueError(f"unsupported data_download.dividend_type: {raw!r}")
+        return normalized
+
+    def _parse_daily_trigger_time(self) -> tuple[int, int, int]:
+        raw = str(self.data_download_config.get("daily_trigger_time") or "15:30").strip()
+        parts = raw.split(":")
+        if len(parts) not in {2, 3}:
+            raise ValueError(f"invalid data_download.daily_trigger_time: {raw!r}")
+        hour = int(parts[0])
+        minute = int(parts[1])
+        second = int(parts[2]) if len(parts) == 3 else 0
+        if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+            raise ValueError(f"invalid data_download.daily_trigger_time: {raw!r}")
+        return hour, minute, second
+
+    def run_boot_data_download_if_enabled(self) -> bool:
+        if not self._config_flag_enabled(self.data_download_config.get("boot_data_download", 0)):
+            return False
+
+        try:
+            start_time = self._normalize_download_day(
+                self.data_download_config.get("boot_check_startday", ""),
+                end_of_day=False,
+            )
+            end_time = self._normalize_download_day(
+                self.data_download_config.get("boot_check_endday", ""),
+                end_of_day=True,
+            )
+            if not start_time or not end_time:
+                self.log_warning(
+                    "data_download",
+                    "boot 1min download skipped",
+                    reason="boot_check_startday or boot_check_endday is empty",
+                )
+                return False
+            if start_time > end_time:
+                raise ValueError("boot_check_startday must be earlier than or equal to boot_check_endday")
+
+            self.download_all_a_share_1min(start_time, end_time, reason="boot")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("data_download", "boot 1min download failed", error=exc)
+            return False
+
+    def start_daily_1min_download_scheduler(self) -> None:
+        if not self._config_flag_enabled(self.data_download_config.get("daily_1min_download", 1)):
+            return
+        if self._data_download_thread is not None and self._data_download_thread.is_alive():
+            return
+
+        self._parse_daily_trigger_time()
+        self._data_download_stop.clear()
+        self._data_download_thread = threading.Thread(
+            target=self._daily_1min_download_loop,
+            name="XTQ-1min-download",
+            daemon=True,
+        )
+        self._data_download_thread.start()
+        self.log_info(
+            "data_download",
+            "daily 1min download scheduler started",
+            trigger_time=self.data_download_config.get("daily_trigger_time", "15:30"),
+        )
+
+    def stop_daily_1min_download_scheduler(self) -> None:
+        self._data_download_stop.set()
+        thread = self._data_download_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
+        self._data_download_thread = None
+
+    def _daily_1min_download_loop(self) -> None:
+        interval = max(10, int(self.data_download_config.get("check_interval_seconds", 60) or 60))
+        while not self._data_download_stop.wait(interval):
+            try:
+                self.run_daily_1min_download_check()
+            except Exception as exc:  # noqa: BLE001
+                self.log_error("data_download", "daily 1min download check failed", error=exc)
+
+    def run_daily_1min_download_check(self, now: datetime | None = None) -> bool:
+        if not self._config_flag_enabled(self.data_download_config.get("daily_1min_download", 1)):
+            return False
+
+        current = now or datetime.now(CHINA_TZ)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=CHINA_TZ)
+        else:
+            current = current.astimezone(CHINA_TZ)
+
+        hour, minute, second = self._parse_daily_trigger_time()
+        trigger_time = current.replace(hour=hour, minute=minute, second=second, microsecond=0)
+        day_token = current.strftime("%Y%m%d")
+        if current < trigger_time:
+            return False
+        if day_token in self._daily_1min_downloaded_dates:
+            return False
+        if day_token in self._daily_1min_checked_non_trading_dates:
+            return False
+
+        if not self.is_trading_day(current.date()):
+            self._daily_1min_checked_non_trading_dates.add(day_token)
+            self.log_info("data_download", "daily 1min download skipped", trade_date=day_token, reason="not-trading-day")
+            return False
+
+        start_time = f"{day_token}000000"
+        end_time = f"{day_token}235959"
+        try:
+            count = self.download_all_a_share_1min(start_time, end_time, reason="daily")
+            self._daily_1min_downloaded_dates.add(day_token)
+            return count > 0
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("data_download", "daily 1min download failed", trade_date=day_token, error=exc)
+            return False
+
+    def is_trading_day(self, target_day: date) -> bool:
+        day_token = target_day.strftime("%Y%m%d")
+        market = str(self.data_download_config.get("calendar_market") or "SH")
+        try:
+            if hasattr(self.xtdata, "get_trading_dates"):
+                dates = self.xtdata.get_trading_dates(market, day_token, day_token, -1)
+            elif hasattr(self.xtdata, "get_trading_calendar"):
+                dates = self.xtdata.get_trading_calendar(market, day_token, day_token)
+            else:
+                return target_day.weekday() < 5
+        except Exception as exc:  # noqa: BLE001
+            self.log_warning("data_download", "trading calendar unavailable; fallback to weekday", error=exc)
+            return target_day.weekday() < 5
+
+        return self._trading_calendar_contains_day(dates, day_token)
+
+    def _trading_calendar_contains_day(self, dates: Any, day_token: str) -> bool:
+        if dates is None:
+            return False
+        if isinstance(dates, dict):
+            iterable = dates.values()
+        else:
+            iterable = dates
+        try:
+            for item in iterable:
+                if self._calendar_item_to_day(item) == day_token:
+                    return True
+        except TypeError:
+            return self._calendar_item_to_day(dates) == day_token
+        return False
+
+    def _calendar_item_to_day(self, item: Any) -> str:
+        if isinstance(item, datetime):
+            return item.astimezone(CHINA_TZ).strftime("%Y%m%d")
+        if isinstance(item, date):
+            return item.strftime("%Y%m%d")
+        if isinstance(item, dict):
+            for key in ("date", "trade_date", "trading_day", "time", "timestamp"):
+                if key in item:
+                    day = self._calendar_item_to_day(item[key])
+                    if day:
+                        return day
+            return ""
+        if isinstance(item, (int, float)):
+            parsed = parse_xt_timestamp(item)
+            return parsed.astimezone(CHINA_TZ).strftime("%Y%m%d") if parsed else ""
+
+        raw = str(item or "").strip()
+        digits = "".join(char for char in raw if char.isdigit())
+        if len(digits) >= 8 and digits[:2] in {"19", "20"}:
+            return digits[:8]
+        if digits:
+            parsed = parse_xt_timestamp(digits)
+            return parsed.astimezone(CHINA_TZ).strftime("%Y%m%d") if parsed else ""
+        return ""
+
+    def download_all_a_share_1min(self, start_time: str, end_time: str, *, reason: str) -> int:
+        if not self._data_download_lock.acquire(blocking=False):
+            self.log_warning("data_download", "1min download skipped", reason=reason, status="already-running")
+            return 0
+
+        try:
+            stock_list = self._get_a_share_stock_list()
+            if not stock_list:
+                self.log_warning("data_download", "1min download skipped", reason=reason, status="empty-stock-list")
+                return 0
+
+            batch_size = max(1, int(self.data_download_config.get("batch_size", 200) or 200))
+            total = len(stock_list)
+            self.log_info(
+                "data_download",
+                "1min download started",
+                reason=reason,
+                symbols=total,
+                start_time=start_time,
+                end_time=end_time,
+                batch_size=batch_size,
+                dividend_type=self._data_download_dividend_type(),
+            )
+
+            downloaded = 0
+            for index in range(0, total, batch_size):
+                if self._data_download_stop.is_set():
+                    self.log_warning("data_download", "1min download stopped", reason=reason, downloaded=downloaded, total=total)
+                    break
+                batch = stock_list[index:index + batch_size]
+                self._download_history_1min_batch(batch, start_time, end_time)
+                downloaded += len(batch)
+                self.log_info(
+                    "data_download",
+                    "1min download batch done",
+                    reason=reason,
+                    downloaded=downloaded,
+                    total=total,
+                )
+
+            self.log_info("data_download", "1min download completed", reason=reason, downloaded=downloaded, total=total)
+            return downloaded
+        finally:
+            self._data_download_lock.release()
+
+    def _get_a_share_stock_list(self) -> list[str]:
+        if hasattr(self.xtdata, "download_sector_data"):
+            try:
+                self.xtdata.download_sector_data()
+            except Exception as exc:  # noqa: BLE001
+                self.log_warning("data_download", "download sector data failed", error=exc)
+
+        if not hasattr(self.xtdata, "get_stock_list_in_sector"):
+            raise RuntimeError("current xtquant does not support get_stock_list_in_sector")
+
+        sectors = self.data_download_config.get("stock_sectors") or ["沪深A股"]
+        if isinstance(sectors, str):
+            sectors = [sectors]
+
+        seen: set[str] = set()
+        symbols: list[str] = []
+        for sector in sectors:
+            sector_name = str(sector).strip()
+            if not sector_name:
+                continue
+            sector_symbols = self.xtdata.get_stock_list_in_sector(sector_name) or []
+            for symbol in sector_symbols:
+                xt_symbol = str(symbol).strip()
+                if not xt_symbol:
+                    continue
+                if "." in xt_symbol and xt_symbol.rsplit(".", 1)[-1] not in {"SH", "SZ", "BJ"}:
+                    continue
+                if xt_symbol not in seen:
+                    seen.add(xt_symbol)
+                    symbols.append(xt_symbol)
+        return symbols
+
+    def _download_history_1min_batch(self, stock_list: list[str], start_time: str, end_time: str) -> Any:
+        dividend_type = self._data_download_dividend_type()
+        if dividend_type in {"front", "back", "front_ratio", "back_ratio"}:
+            self._ensure_financial_data(stock_list)
+
+        if hasattr(self.xtdata, "download_history_data2"):
+            callback = self._make_download_progress_callback("xtdata.download_history_data2")
+            try:
+                return self.xtdata.download_history_data2(stock_list, "1m", start_time, end_time, callback=callback)
+            except TypeError:
+                return self.xtdata.download_history_data2(stock_list, "1m", start_time, end_time)
+
+        if hasattr(self.xtdata, "download_history_data"):
+            callback = self._make_download_progress_callback("xtdata.download_history_data")
+            try:
+                return self.xtdata.download_history_data(stock_list, "1m", start_time, end_time, callback=callback)
+            except TypeError:
+                return self.xtdata.download_history_data(stock_list, "1m", start_time, end_time)
+
+        raise RuntimeError("current xtquant does not support download_history_data")
+
     def register_rpc(self) -> None:
         for name in (
             "register_client",
@@ -266,6 +598,7 @@ class XtQuantBridge:
             "cancel_order",
             "query_history",
             "get_tick",
+            "get_l1_tick",
             "get_order",
             "get_trade",
             "get_position",
@@ -321,8 +654,68 @@ class XtQuantBridge:
         return callback
 
     _DATA_FETCH_METHODS = frozenset({"xtdata.get_market_data_ex", "xtdata.get_local_data"})
+    _HISTORY_DOWNLOAD_METHODS = frozenset({"xtdata.download_history_data2", "xtdata.download_history_data"})
+
+    @staticmethod
+    def _arg_period(rpc_name: str, args: tuple, kwargs: dict) -> str:
+        if "period" in kwargs:
+            return str(kwargs.get("period") or "").strip().lower()
+        if rpc_name in XtQuantBridge._HISTORY_DOWNLOAD_METHODS and len(args) >= 2:
+            return str(args[1] or "").strip().lower()
+        if rpc_name in XtQuantBridge._DATA_FETCH_METHODS and len(args) >= 3:
+            return str(args[2] or "").strip().lower()
+        return ""
+
+    @staticmethod
+    def _arg_stock_list(rpc_name: str, args: tuple, kwargs: dict) -> list[str]:
+        stock_list = kwargs.get("stock_list")
+        if stock_list is None and args:
+            stock_list = args[0]
+        if isinstance(stock_list, str):
+            return [stock_list]
+        try:
+            return [str(item) for item in stock_list or [] if str(item or "").strip()]
+        except TypeError:
+            return []
+
+    def _tick_market_snapshot_result(self, stock_list: list[str]) -> dict[str, Any]:
+        rows_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        if not stock_list:
+            return rows_by_symbol
+
+        raw = self.xtdata.get_full_tick(stock_list) if hasattr(self.xtdata, "get_full_tick") else {}
+        if not isinstance(raw, dict):
+            raw = {}
+        for xt_symbol in stock_list:
+            payload = raw.get(xt_symbol) or {}
+            if not payload:
+                continue
+            row = dict(payload)
+            if "time" not in row:
+                # get_full_tick reports the timestamp as "timetag"
+                # ("YYYYMMDD HH:MM:SS"); subscribed ticks use "time"/"timestamp".
+                row["time"] = row.get("timestamp") or row.get("timetag")
+            rows_by_symbol[xt_symbol] = [row]
+        return serialize_xtdata_result(rows_by_symbol)
+
+    def _tick_history_enabled(self) -> bool:
+        # When enabled (default), tick-period download/fetch passes through to
+        # the real xtdata so callers can read a full intraday tick series
+        # (needed by dbfp 历史复盘). Set data_download.tick_history_enabled=0
+        # to fall back to the L1-snapshot-only behaviour.
+        return self._config_flag_enabled(self.data_download_config.get("tick_history_enabled", 1))
 
     def call_xtdata(self, rpc_name: str, *args, **kwargs):
+        period = self._arg_period(rpc_name, args, kwargs)
+        if period == "tick" and not self._tick_history_enabled():
+            if rpc_name in self._HISTORY_DOWNLOAD_METHODS:
+                self.log_warning("rpc", "tick history download skipped; use get_l1_tick/get_full_tick for L1 snapshot", method=rpc_name)
+                return {"skipped": True, "reason": "tick-history-download-disabled"}
+            if rpc_name in self._DATA_FETCH_METHODS:
+                stock_list = self._arg_stock_list(rpc_name, args, kwargs)
+                self.log_warning("rpc", "tick history fetch served as L1 snapshot", method=rpc_name, stock_list=stock_list)
+                return self._tick_market_snapshot_result(stock_list)
+
         if rpc_name in self._DATA_FETCH_METHODS:
             self._log_data_fetch_request(rpc_name, args, kwargs)
         else:
@@ -597,10 +990,30 @@ class XtQuantBridge:
         self.xt_trader.register_callback(self.callback_router)
         self.xt_trader.start()
 
-        connect_result = self.xt_trader.connect()
+        # connect() 在 start() 之后立刻调用常返回 -1（交易线程尚未就绪），
+        # 第一次失败重试几次即可成功。可用 xt.connect_retries / connect_retry_interval 调整。
+        import time as _time
+        retries = max(1, int(self.xt_config.get("connect_retries", 5) or 5))
+        retry_interval = float(self.xt_config.get("connect_retry_interval", 1.0) or 1.0)
+        connect_result = -1
+        for attempt in range(1, retries + 1):
+            connect_result = self.xt_trader.connect()
+            if connect_result == 0:
+                if attempt > 1:
+                    self.log_info("lifecycle", "xttrader connect succeeded after retry", attempt=attempt)
+                break
+            self.log_warning(
+                "lifecycle",
+                "xttrader connect failed; retrying",
+                code=connect_result,
+                attempt=attempt,
+                retries=retries,
+            )
+            if attempt < retries:
+                _time.sleep(retry_interval)
         if connect_result != 0:
             raise RuntimeError(
-                f"xttrader connect failed (code={connect_result})\n"
+                f"xttrader connect failed (code={connect_result}) after {retries} attempts\n"
                 f"  userdata_path: {self.userdata_path}\n"
                 f"  session_id: {session_id}\n"
                 f"  常见原因:\n"
@@ -670,7 +1083,30 @@ class XtQuantBridge:
 
     def handle_tick(self, tick) -> None:
         self.ticks[tick.vt_symbol] = tick
+        self.l1_ticks[tick.vt_symbol] = self._tick_to_l1_payload(tick)
         self.publish_data(EVENT_TICK, EVENT_TICK + tick.vt_symbol, tick)
+
+    @staticmethod
+    def _tick_to_l1_payload(tick: Any) -> dict[str, Any]:
+        payload = {
+            "symbol": getattr(tick, "symbol", ""),
+            "exchange": getattr(getattr(tick, "exchange", None), "value", getattr(tick, "exchange", "")),
+            "vt_symbol": getattr(tick, "vt_symbol", ""),
+            "datetime": getattr(tick, "datetime", None),
+            "last_price": getattr(tick, "last_price", 0.0),
+            "volume": getattr(tick, "volume", 0.0),
+            "turnover": getattr(tick, "turnover", 0.0),
+            "open_price": getattr(tick, "open_price", 0.0),
+            "high_price": getattr(tick, "high_price", 0.0),
+            "low_price": getattr(tick, "low_price", 0.0),
+            "pre_close": getattr(tick, "pre_close", 0.0),
+        }
+        for index in range(1, 6):
+            payload[f"bid_price_{index}"] = getattr(tick, f"bid_price_{index}", 0.0)
+            payload[f"ask_price_{index}"] = getattr(tick, f"ask_price_{index}", 0.0)
+            payload[f"bid_volume_{index}"] = getattr(tick, f"bid_volume_{index}", 0.0)
+            payload[f"ask_volume_{index}"] = getattr(tick, f"ask_volume_{index}", 0.0)
+        return serialize_xtdata_result(payload)
 
     def handle_order(self, order, system_orderid: str = "") -> None:
         self.orders[order.vt_orderid] = order
@@ -772,6 +1208,108 @@ class XtQuantBridge:
         else:
             self.log_debug("market_data", "subscribe skipped", vt_symbol=req.vt_symbol, reason="already-subscribed")
 
+    @staticmethod
+    def _infer_exchange_from_symbol(symbol: str) -> Exchange:
+        code = str(symbol or "").strip().zfill(6)
+        if code.startswith("6"):
+            return Exchange.SSE
+        if code.startswith(("4", "8")):
+            return Exchange.BSE
+        return Exchange.SZSE
+
+    @staticmethod
+    def _normalize_l1_xt_symbol(symbol: str, exchange: Any = None) -> tuple[str, str]:
+        raw = str(symbol or "").strip()
+        if "." in raw:
+            code, suffix = raw.split(".", 1)
+            suffix_upper = suffix.upper()
+            if suffix_upper in {"SH", "SZ", "BJ"}:
+                xt_suffix = suffix_upper
+                vt_suffix = {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}[xt_suffix]
+            else:
+                vt_suffix = suffix_upper
+                xt_suffix = {"SSE": "SH", "SZSE": "SZ", "BSE": "BJ"}.get(vt_suffix, suffix_upper)
+            code = code.zfill(6) if code.isdigit() else code
+            return f"{code}.{xt_suffix}", f"{code}.{vt_suffix}"
+
+        code = raw.zfill(6) if raw.isdigit() else raw
+        ex = exchange or XtQuantBridge._infer_exchange_from_symbol(code)
+        xt_symbol = vnpy_symbol_to_xt(code, ex) if isinstance(ex, Exchange) else f"{code}.{str(ex).upper()}"
+        vt_suffix = getattr(ex, "value", str(ex))
+        return xt_symbol, f"{code}.{vt_suffix}"
+
+    @staticmethod
+    def _full_tick_has_data(payload: Any) -> bool:
+        if not isinstance(payload, dict) or not payload:
+            return False
+        try:
+            if float(payload.get("lastPrice", 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return bool(payload.get("timetag") or payload.get("time") or payload.get("timestamp"))
+
+    def _prime_l1_subscription(self, xt_symbol: str, vt_symbol: str) -> None:
+        """Subscribe a code once so get_full_tick has live data to return.
+
+        QMT's get_full_tick returns {} or all-zero stubs for codes that were
+        never subscribed; subscribing wakes the quote feed and also warms
+        self.l1_ticks via on_tick_data for subsequent polls.
+        """
+        if vt_symbol in self.subscriptions:
+            return
+        if not hasattr(self.xtdata, "subscribe_quote"):
+            return
+        try:
+            seq = self.xtdata.subscribe_quote(xt_symbol, period="tick", callback=self.callback_router.on_tick_data)
+            self.subscriptions[vt_symbol] = seq
+            self.log_info("market_data", "l1 subscribe primed", vt_symbol=vt_symbol, xt_symbol=xt_symbol, seq=seq)
+        except Exception as exc:  # noqa: BLE001
+            self.log_warning("market_data", "l1 subscribe prime failed", xt_symbol=xt_symbol, error=exc)
+
+    def _fetch_full_tick_payload(self, xt_symbol: str, vt_symbol: str) -> dict[str, Any] | None:
+        def _extract() -> dict[str, Any] | None:
+            result = self.xtdata.get_full_tick([xt_symbol]) or {}
+            payload = result.get(xt_symbol) if isinstance(result, dict) else None
+            return payload if self._full_tick_has_data(payload) else None
+
+        payload = _extract()
+        if payload is not None:
+            return payload
+
+        # Prime via subscription and retry briefly: live tick data arrives
+        # asynchronously after the first subscribe.
+        self._prime_l1_subscription(xt_symbol, vt_symbol)
+        import time as _time
+        for _ in range(5):
+            _time.sleep(0.2)
+            cached = self.l1_ticks.get(vt_symbol)
+            if cached:
+                return None  # cache already warmed by on_tick_data; caller returns it
+            payload = _extract()
+            if payload is not None:
+                return payload
+        return None
+
+    def get_l1_tick(self, symbol: str, exchange: Any = None) -> dict[str, Any] | None:
+        xt_symbol, vt_symbol = self._normalize_l1_xt_symbol(symbol, exchange)
+        cached = self.l1_ticks.get(vt_symbol)
+        if cached:
+            return cached
+
+        if not hasattr(self.xtdata, "get_full_tick"):
+            return None
+        payload = self._fetch_full_tick_payload(xt_symbol, vt_symbol)
+        if payload is None:
+            # _fetch_full_tick_payload may have warmed the cache via subscription.
+            return self.l1_ticks.get(vt_symbol)
+        contract = self.ensure_contract(xt_symbol)
+        tick = self.translator.translate_tick(xt_symbol, payload, contract)
+        built = self._tick_to_l1_payload(tick)
+        self.l1_ticks[vt_symbol] = built
+        self.ticks[vt_symbol] = tick
+        return built
+
     def send_order(self, req: OrderRequest) -> str:
         payload = self.translator.order_request_to_xt(req)
         local_orderid = f"XTQ{next(self._order_counter):010d}"
@@ -816,6 +1354,13 @@ class XtQuantBridge:
     def query_history(self, req):
         xt_symbol = vnpy_symbol_to_xt(req.symbol, req.exchange)
         self.ensure_contract(xt_symbol)
+        if getattr(req, "interval", None) == Interval.TICK:
+            self.log_warning(
+                "history",
+                "tick history query skipped; use get_l1_tick/get_full_tick for L1 snapshot",
+                vt_symbol=req.vt_symbol,
+            )
+            return []
         xt_interval = map_vnpy_interval_to_xt(req.interval)
         start_time = format_history_time(req.start)
         end_time = format_history_time(req.end)

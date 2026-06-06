@@ -41,6 +41,9 @@ class RpcRequestHandler:
     def get_tick(self, vt_symbol: str):
         return self.bridge.ticks.get(vt_symbol)
 
+    def get_l1_tick(self, symbol: str, exchange=None):
+        return self.bridge.get_l1_tick(symbol, exchange)
+
     def get_order(self, vt_orderid: str):
         return self.bridge.orders.get(vt_orderid)
 

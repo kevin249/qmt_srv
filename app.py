@@ -26,6 +26,18 @@ DEFAULT_LOG_CATEGORIES = {
     "history": False,
     "contract": False,
     "heartbeat": False,
+    "data_download": True,
+}
+DEFAULT_DATA_DOWNLOAD_CONFIG = {
+    "daily_1min_download": 1,
+    "daily_trigger_time": "15:30",
+    "boot_data_download": 0,
+    "boot_check_startday": "",
+    "boot_check_endday": "",
+    "batch_size": 200,
+    "stock_sectors": ["沪深A股"],
+    "calendar_market": "SH",
+    "dividend_type": "front",
 }
 
 
@@ -118,6 +130,7 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
     rpc = config.get("rpc", {})
     logging_config = config.get("logging", {})
     csv_data_source = config.get("csv_data_source", {})
+    data_download = config.get("data_download", {})
     legacy_csv_path = str(config.get("csv_data_path", "") or "").strip()
 
     if not isinstance(xt, dict):
@@ -128,6 +141,8 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("logging section must be an object")
     if not isinstance(csv_data_source, dict):
         raise ValueError("csv_data_source section must be an object")
+    if not isinstance(data_download, dict):
+        raise ValueError("data_download section must be an object")
 
     qmt_path = normalize_qmt_root_path(xt.get("qmt_path", ""))
     account_id = str(xt.get("account_id", "") or "").strip()
@@ -135,6 +150,46 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("xt.qmt_path is required")
     if not account_id:
         raise ValueError("xt.account_id is required")
+
+    def data_download_value(name: str) -> Any:
+        return data_download.get(name, config.get(name, DEFAULT_DATA_DOWNLOAD_CONFIG[name]))
+
+    raw_stock_sectors = data_download_value("stock_sectors")
+    if isinstance(raw_stock_sectors, str):
+        stock_sectors = [raw_stock_sectors]
+    elif isinstance(raw_stock_sectors, list):
+        stock_sectors = [str(item).strip() for item in raw_stock_sectors if str(item).strip()]
+    else:
+        raise ValueError("data_download.stock_sectors must be a string or list")
+    if not stock_sectors:
+        stock_sectors = list(DEFAULT_DATA_DOWNLOAD_CONFIG["stock_sectors"])
+
+    daily_trigger_time = str(
+        data_download.get(
+            "daily_trigger_time",
+            data_download.get(
+                "daily_1min_time",
+                config.get("daily_trigger_time", DEFAULT_DATA_DOWNLOAD_CONFIG["daily_trigger_time"]),
+            ),
+        )
+        or DEFAULT_DATA_DOWNLOAD_CONFIG["daily_trigger_time"]
+    ).strip()
+    dividend_type = str(
+        data_download.get(
+            "dividend_type",
+            data_download.get(
+                "download_mode",
+                data_download.get(
+                    "mode",
+                    config.get(
+                        "download_mode",
+                        config.get("mode", config.get("dividend_type", DEFAULT_DATA_DOWNLOAD_CONFIG["dividend_type"])),
+                    ),
+                ),
+            ),
+        )
+        or DEFAULT_DATA_DOWNLOAD_CONFIG["dividend_type"]
+    ).strip()
 
     return {
         "xt": {
@@ -167,6 +222,17 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
         "csv_data_source": {
             "path": str(csv_data_source.get("path", "") or legacy_csv_path or "").strip(),
             "default_adjust": str(csv_data_source.get("default_adjust", "前复权") or "前复权"),
+        },
+        "data_download": {
+            "daily_1min_download": int(data_download_value("daily_1min_download") or 0),
+            "daily_trigger_time": daily_trigger_time,
+            "boot_data_download": int(data_download_value("boot_data_download") or 0),
+            "boot_check_startday": str(data_download_value("boot_check_startday") or "").strip(),
+            "boot_check_endday": str(data_download_value("boot_check_endday") or "").strip(),
+            "batch_size": max(1, int(data_download_value("batch_size") or DEFAULT_DATA_DOWNLOAD_CONFIG["batch_size"])),
+            "stock_sectors": stock_sectors,
+            "calendar_market": str(data_download_value("calendar_market") or "SH").strip() or "SH",
+            "dividend_type": dividend_type,
         },
     }
 

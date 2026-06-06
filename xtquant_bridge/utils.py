@@ -93,6 +93,11 @@ def parse_xt_timestamp(value: int | float | str | None) -> datetime | None:
         if raw.isdigit():
             value = int(raw)
         else:
+            # QMT get_full_tick "timetag" comes as "YYYYMMDD HH:MM:SS"; strip
+            # separators and parse the resulting 14-digit datetime.
+            digits = "".join(char for char in raw if char.isdigit())
+            if len(digits) == 14:
+                return datetime.strptime(digits, "%Y%m%d%H%M%S").replace(tzinfo=CHINA_TZ)
             return None
     if isinstance(value, (int, float)):
         timestamp = float(value)

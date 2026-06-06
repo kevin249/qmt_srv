@@ -7,7 +7,10 @@
     "simulation": false,
     "account_type": "STOCK",
     "qmt_path": "D:\\qmt",
-    "account_id": "123456"
+    "account_id": "123456",
+    "session_id": 1,
+    "connect_retries": 5,
+    "connect_retry_interval": 1.0
   },
   "rpc": {
     "rep_address": "tcp://*:20140",
@@ -16,6 +19,18 @@
   "csv_data_source": {
     "path": "",
     "default_adjust": "前复权"
+  },
+  "data_download": {
+    "daily_1min_download": 1,
+    "daily_trigger_time": "15:30",
+    "boot_data_download": 0,
+    "boot_check_startday": "",
+    "boot_check_endday": "",
+    "batch_size": 200,
+    "stock_sectors": ["沪深A股"],
+    "calendar_market": "SH",
+    "dividend_type": "front",
+    "tick_history_enabled": 1
   },
   "logging": {
     "enabled": true,
@@ -33,7 +48,8 @@
       "trade": true,
       "history": false,
       "contract": false,
-      "heartbeat": false
+      "heartbeat": false,
+      "data_download": true
     }
   }
 }

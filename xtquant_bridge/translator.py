@@ -70,7 +70,11 @@ class DataTranslator:
             gateway_name=self.gateway_name,
             symbol=symbol,
             exchange=exchange,
-            datetime=parse_xt_timestamp(payload.get("time")) or parse_xt_timestamp(payload.get("timestamp")),
+            datetime=(
+                parse_xt_timestamp(payload.get("time"))
+                or parse_xt_timestamp(payload.get("timestamp"))
+                or parse_xt_timestamp(payload.get("timetag"))
+            ),
             name=(contract.name if contract else payload.get("instrument_name", "")),
             volume=float(payload.get("volume", 0) or 0),
             turnover=float(payload.get("amount", 0) or 0),

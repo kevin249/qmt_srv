@@ -14,6 +14,10 @@ CONFIG_USER_PATH = Path(__file__).with_name("config.user.json")
 DEFAULT_REP_ADDRESS = "tcp://*:20140"
 DEFAULT_PUB_ADDRESS = "tcp://*:20141"
 DEFAULT_EVENT_QUEUE_SIZE = 10000
+DEFAULT_RPC_FAST_WORKERS = 8
+DEFAULT_RPC_FAST_QUEUE_SIZE = 128
+DEFAULT_RPC_SLOW_WORKERS = 2
+DEFAULT_RPC_SLOW_QUEUE_SIZE = 4
 DEFAULT_LOG_CATEGORIES = {
     "lifecycle": True,
     "rpc": True,
@@ -38,6 +42,7 @@ DEFAULT_DATA_DOWNLOAD_CONFIG = {
     "stock_sectors": ["沪深A股"],
     "calendar_market": "SH",
     "dividend_type": "front",
+    "tick_history_enabled": 1,
 }
 
 
@@ -208,6 +213,13 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
         "rpc": {
             "rep_address": str(rpc.get("rep_address", DEFAULT_REP_ADDRESS) or DEFAULT_REP_ADDRESS),
             "pub_address": str(rpc.get("pub_address", DEFAULT_PUB_ADDRESS) or DEFAULT_PUB_ADDRESS),
+            "fast_workers": max(1, int(rpc.get("fast_workers", rpc.get("worker_threads", DEFAULT_RPC_FAST_WORKERS)) or 1)),
+            "fast_queue_size": max(
+                0,
+                int(rpc.get("fast_queue_size", rpc.get("queue_size", DEFAULT_RPC_FAST_QUEUE_SIZE)) or 0),
+            ),
+            "slow_workers": max(1, int(rpc.get("slow_workers", DEFAULT_RPC_SLOW_WORKERS) or 1)),
+            "slow_queue_size": max(0, int(rpc.get("slow_queue_size", DEFAULT_RPC_SLOW_QUEUE_SIZE) or 0)),
         },
         "logging": {
             "enabled": bool(logging_config.get("enabled", True)),
@@ -233,6 +245,7 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
             "stock_sectors": stock_sectors,
             "calendar_market": str(data_download_value("calendar_market") or "SH").strip() or "SH",
             "dividend_type": dividend_type,
+            "tick_history_enabled": int(data_download_value("tick_history_enabled") or 0),
         },
     }
 

@@ -14,7 +14,11 @@
   },
   "rpc": {
     "rep_address": "tcp://*:20140",
-    "pub_address": "tcp://*:20141"
+    "pub_address": "tcp://*:20141",
+    "fast_workers": 8,
+    "fast_queue_size": 128,
+    "slow_workers": 2,
+    "slow_queue_size": 4
   },
   "csv_data_source": {
     "path": "",

@@ -15,6 +15,7 @@ from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_OR
 from vnpy.trader.object import LogData, OrderRequest
 
 from .callback_router import XtQuantCallbackRouter
+from .concurrent_rpc_server import ConcurrentRpcServer
 from .csv_data_source import CsvDataSource
 from .event_publisher import EventPublisher
 from .rpc_handler import RpcRequestHandler
@@ -78,7 +79,7 @@ class XtQuantBridge:
         self.rpc_config = config["rpc"]
         self.data_download_config = config.get("data_download", {}) or {}
 
-        self.rpc_server = rpc_server or RpcServer()
+        self.rpc_server = rpc_server or self._create_rpc_server(self.rpc_config)
         self.xtdata = xtdata_module
         self.xtdatacenter = xtdatacenter_module
         self.xttrader_class = xttrader_class
@@ -132,6 +133,15 @@ class XtQuantBridge:
         self._data_download_stop = threading.Event()
         self._data_download_thread: threading.Thread | None = None
         self._data_download_lock = threading.Lock()
+
+    @staticmethod
+    def _create_rpc_server(rpc_config: dict[str, Any]) -> ConcurrentRpcServer:
+        return ConcurrentRpcServer(
+            fast_workers=max(1, int(rpc_config.get("fast_workers", rpc_config.get("worker_threads", 8)) or 8)),
+            fast_queue_size=max(0, int(rpc_config.get("fast_queue_size", rpc_config.get("queue_size", 128)) or 0)),
+            slow_workers=max(1, int(rpc_config.get("slow_workers", 2) or 2)),
+            slow_queue_size=max(0, int(rpc_config.get("slow_queue_size", 4) or 0)),
+        )
 
     @staticmethod
     def _safe_attr(data: Any, name: str, default: Any = "") -> Any:
@@ -1589,15 +1599,12 @@ class XtQuantBridge:
                           csv_rows=len(csv_rows), csv_range=f"{csv_first} ~ {csv_last}", path=csv_path)
             return csv_rows
 
-        # ── use QMT's earliest date as the cut-off ────────────────────────
-        # CSV fills everything strictly before that date (date-level boundary
-        # avoids partial-day overlaps on the boundary day).
-        qmt_min_date = min((_row_date_str(r) for r in qmt_rows), default="")
-        qmt_max_date = max((_row_date_str(r) for r in qmt_rows), default="")
-        if qmt_min_date:
-            missing = [r for r in csv_rows if r["time"].strftime("%Y-%m-%d") < qmt_min_date]
-        else:
-            missing = list(csv_rows)
+        # Fill whole missing trading days from CSV.  Date-level matching avoids
+        # mixing two providers inside the same intraday session.
+        qmt_dates = {_row_date_str(r) for r in qmt_rows if _row_date_str(r)}
+        qmt_min_date = min(qmt_dates, default="")
+        qmt_max_date = max(qmt_dates, default="")
+        missing = [r for r in csv_rows if r["time"].strftime("%Y-%m-%d") not in qmt_dates]
 
         csv_used_first = missing[0]["time"].strftime("%Y-%m-%d") if missing else ""
         csv_used_last  = missing[-1]["time"].strftime("%Y-%m-%d") if missing else ""
@@ -1615,7 +1622,7 @@ class XtQuantBridge:
             f"[XTQ Bridge]   [1] QMT   : {len(qmt_rows):>7}行  [{qmt_min_date} ~ {qmt_max_date}]\n"
             f"[XTQ Bridge]   [2] CSV补充: {len(missing):>7}行  [{csv_used_first} ~ {csv_used_last}]\n"
             f"[XTQ Bridge]   [3] 合并后 : {len(qmt_rows) + len(missing):>7}行  "
-            f"[{min(csv_used_first, qmt_min_date)} ~ {qmt_max_date}]"
+            f"[{min(csv_used_first, qmt_min_date)} ~ {max(csv_used_last, qmt_max_date)}]"
         )
         self.log_info(
             "history",
@@ -1626,7 +1633,7 @@ class XtQuantBridge:
             missing_from_csv=len(missing),
             csv_range=f"{csv_used_first} ~ {csv_used_last}",
             merged_total=len(qmt_rows) + len(missing),
-            merged_range=f"{min(csv_used_first, qmt_min_date)} ~ {qmt_max_date}",
+            merged_range=f"{min(csv_used_first, qmt_min_date)} ~ {max(csv_used_last, qmt_max_date)}",
         )
         # CSV rows come first (older), QMT rows follow (newer); sort by full
         # timestamp so minute bars within each day are correctly ordered.

@@ -37,14 +37,21 @@ class ConcurrentRpcServer:
             "xtdata.download_etf_info",
         }
     )
+    DEFAULT_TRADE_METHODS = frozenset({"send_order", "cancel_order"})
 
     def __init__(
         self,
         *,
+        trade_workers: int = 1,
+        trade_queue_size: int = 16,
+        trade_queue_timeout: float = 0.5,
         fast_workers: int = 8,
         fast_queue_size: int = 128,
+        fast_queue_timeout: float = 3.0,
         slow_workers: int = 2,
         slow_queue_size: int = 4,
+        slow_queue_timeout: float = 10.0,
+        trade_methods: set[str] | None = None,
         slow_methods: set[str] | None = None,
     ) -> None:
         self._functions: dict[str, Callable] = {}
@@ -60,14 +67,22 @@ class ConcurrentRpcServer:
         self._publish_lock = threading.Lock()
         self._heartbeat_at: float | None = None
 
+        self._trade_workers = max(1, int(trade_workers or 1))
+        self._trade_queue_size = max(0, int(trade_queue_size or 0))
+        self._trade_queue_timeout = max(0.0, float(trade_queue_timeout or 0.0))
         self._fast_workers = max(1, int(fast_workers or 1))
         self._fast_queue_size = max(0, int(fast_queue_size or 0))
+        self._fast_queue_timeout = max(0.0, float(fast_queue_timeout or 0.0))
         self._slow_workers = max(1, int(slow_workers or 1))
         self._slow_queue_size = max(0, int(slow_queue_size or 0))
+        self._slow_queue_timeout = max(0.0, float(slow_queue_timeout or 0.0))
+        self._trade_executor = ThreadPoolExecutor(max_workers=self._trade_workers, thread_name_prefix="qmt-rpc-trade")
         self._fast_executor = ThreadPoolExecutor(max_workers=self._fast_workers, thread_name_prefix="qmt-rpc-fast")
         self._slow_executor = ThreadPoolExecutor(max_workers=self._slow_workers, thread_name_prefix="qmt-rpc-slow")
+        self._trade_slots = threading.BoundedSemaphore(self._trade_workers + self._trade_queue_size)
         self._fast_slots = threading.BoundedSemaphore(self._fast_workers + self._fast_queue_size)
         self._slow_slots = threading.BoundedSemaphore(self._slow_workers + self._slow_queue_size)
+        self._trade_methods = set(trade_methods or self.DEFAULT_TRADE_METHODS)
         self._slow_methods = set(slow_methods or self.DEFAULT_SLOW_METHODS)
 
     def is_active(self) -> bool:
@@ -91,6 +106,7 @@ class ConcurrentRpcServer:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         self._thread = None
+        self._trade_executor.shutdown(wait=False, cancel_futures=True)
         self._fast_executor.shutdown(wait=False, cancel_futures=True)
         self._slow_executor.shutdown(wait=False, cancel_futures=True)
         try:
@@ -112,14 +128,25 @@ class ConcurrentRpcServer:
                 self._send_response(frames[:-1], [False, traceback.format_exc()])
                 continue
 
-            executor, slots = self._select_pool(str(name))
+            name_str = str(name)
+            kind = self._pool_kind(name_str)
+            executor, slots = self._select_pool(name_str)
             if not slots.acquire(blocking=False):
-                kind = "slow" if str(name) in self._slow_methods else "fast"
-                self._send_response(frames[:-1], [False, self._queue_full_error(str(name), kind)])
+                self._send_response(frames[:-1], [False, self._queue_full_error(name_str, kind)])
                 continue
 
             try:
-                executor.submit(self._execute_request, frames[:-1], str(name), args, kwargs, slots)
+                executor.submit(
+                    self._execute_request,
+                    frames[:-1],
+                    name_str,
+                    args,
+                    kwargs,
+                    slots,
+                    time(),
+                    self._queue_timeout(kind),
+                    kind,
+                )
             except RuntimeError as exc:
                 slots.release()
                 message = f"RpcServer error: failed to enqueue {name!r}: {exc}"
@@ -129,15 +156,34 @@ class ConcurrentRpcServer:
         self._socket_rep.close(0)
 
     def _select_pool(self, name: str) -> tuple[ThreadPoolExecutor, threading.BoundedSemaphore]:
+        if name in self._trade_methods:
+            return self._trade_executor, self._trade_slots
         if name in self._slow_methods:
             return self._slow_executor, self._slow_slots
         return self._fast_executor, self._fast_slots
+
+    def _pool_kind(self, name: str) -> str:
+        if name in self._trade_methods:
+            return "trade"
+        return "slow" if name in self._slow_methods else "fast"
+
+    def _queue_timeout(self, kind: str) -> float:
+        if kind == "trade":
+            return self._trade_queue_timeout
+        return self._slow_queue_timeout if kind == "slow" else self._fast_queue_timeout
 
     @staticmethod
     def _queue_full_error(name: str, kind: str) -> str:
         return (
             f"RpcServer busy: {kind} queue is full for {name!r}. "
-            "Please retry later or reduce concurrent history/tick requests."
+            "Please retry later or reduce concurrent requests."
+        )
+
+    @staticmethod
+    def _queue_timeout_error(name: str, kind: str, waited: float, timeout: float) -> str:
+        return (
+            f"RpcServer busy: {kind} queue wait timeout for {name!r} "
+            f"after {waited:.3f}s (limit {timeout:.3f}s). Please retry later."
         )
 
     def _execute_request(
@@ -147,8 +193,17 @@ class ConcurrentRpcServer:
         args: tuple,
         kwargs: dict,
         slots: threading.BoundedSemaphore,
+        queued_at: float,
+        queue_timeout: float,
+        kind: str,
     ) -> None:
         try:
+            waited = time() - queued_at
+            if queue_timeout > 0 and waited > queue_timeout:
+                reply = [False, self._queue_timeout_error(name, kind, waited, queue_timeout)]
+                self._send_response(routing_frames, reply)
+                return
+
             try:
                 func = self._functions[name]
                 result = func(*args, **kwargs)

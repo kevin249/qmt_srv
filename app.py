@@ -14,10 +14,15 @@ CONFIG_USER_PATH = Path(__file__).with_name("config.user.json")
 DEFAULT_REP_ADDRESS = "tcp://*:20140"
 DEFAULT_PUB_ADDRESS = "tcp://*:20141"
 DEFAULT_EVENT_QUEUE_SIZE = 10000
+DEFAULT_RPC_TRADE_WORKERS = 1
+DEFAULT_RPC_TRADE_QUEUE_SIZE = 16
+DEFAULT_RPC_TRADE_QUEUE_TIMEOUT = 0.5
 DEFAULT_RPC_FAST_WORKERS = 8
 DEFAULT_RPC_FAST_QUEUE_SIZE = 128
+DEFAULT_RPC_FAST_QUEUE_TIMEOUT = 3.0
 DEFAULT_RPC_SLOW_WORKERS = 2
 DEFAULT_RPC_SLOW_QUEUE_SIZE = 4
+DEFAULT_RPC_SLOW_QUEUE_TIMEOUT = 10.0
 DEFAULT_LOG_CATEGORIES = {
     "lifecycle": True,
     "rpc": True,
@@ -213,13 +218,27 @@ def build_bridge_config(config: dict[str, Any]) -> dict[str, Any]:
         "rpc": {
             "rep_address": str(rpc.get("rep_address", DEFAULT_REP_ADDRESS) or DEFAULT_REP_ADDRESS),
             "pub_address": str(rpc.get("pub_address", DEFAULT_PUB_ADDRESS) or DEFAULT_PUB_ADDRESS),
+            "trade_workers": max(1, int(rpc.get("trade_workers", DEFAULT_RPC_TRADE_WORKERS) or 1)),
+            "trade_queue_size": max(0, int(rpc.get("trade_queue_size", DEFAULT_RPC_TRADE_QUEUE_SIZE) or 0)),
+            "trade_queue_timeout": max(
+                0.0,
+                float(rpc.get("trade_queue_timeout", DEFAULT_RPC_TRADE_QUEUE_TIMEOUT) or 0.0),
+            ),
             "fast_workers": max(1, int(rpc.get("fast_workers", rpc.get("worker_threads", DEFAULT_RPC_FAST_WORKERS)) or 1)),
             "fast_queue_size": max(
                 0,
                 int(rpc.get("fast_queue_size", rpc.get("queue_size", DEFAULT_RPC_FAST_QUEUE_SIZE)) or 0),
             ),
+            "fast_queue_timeout": max(
+                0.0,
+                float(rpc.get("fast_queue_timeout", DEFAULT_RPC_FAST_QUEUE_TIMEOUT) or 0.0),
+            ),
             "slow_workers": max(1, int(rpc.get("slow_workers", DEFAULT_RPC_SLOW_WORKERS) or 1)),
             "slow_queue_size": max(0, int(rpc.get("slow_queue_size", DEFAULT_RPC_SLOW_QUEUE_SIZE) or 0)),
+            "slow_queue_timeout": max(
+                0.0,
+                float(rpc.get("slow_queue_timeout", DEFAULT_RPC_SLOW_QUEUE_TIMEOUT) or 0.0),
+            ),
         },
         "logging": {
             "enabled": bool(logging_config.get("enabled", True)),

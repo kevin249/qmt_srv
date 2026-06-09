@@ -137,10 +137,15 @@ class XtQuantBridge:
     @staticmethod
     def _create_rpc_server(rpc_config: dict[str, Any]) -> ConcurrentRpcServer:
         return ConcurrentRpcServer(
+            trade_workers=max(1, int(rpc_config.get("trade_workers", 1) or 1)),
+            trade_queue_size=max(0, int(rpc_config.get("trade_queue_size", 16) or 0)),
+            trade_queue_timeout=max(0.0, float(rpc_config.get("trade_queue_timeout", 0.5) or 0.0)),
             fast_workers=max(1, int(rpc_config.get("fast_workers", rpc_config.get("worker_threads", 8)) or 8)),
             fast_queue_size=max(0, int(rpc_config.get("fast_queue_size", rpc_config.get("queue_size", 128)) or 0)),
+            fast_queue_timeout=max(0.0, float(rpc_config.get("fast_queue_timeout", 3.0) or 0.0)),
             slow_workers=max(1, int(rpc_config.get("slow_workers", 2) or 2)),
             slow_queue_size=max(0, int(rpc_config.get("slow_queue_size", 4) or 0)),
+            slow_queue_timeout=max(0.0, float(rpc_config.get("slow_queue_timeout", 10.0) or 0.0)),
         )
 
     @staticmethod
@@ -720,7 +725,16 @@ class XtQuantBridge:
         # to fall back to the L1-snapshot-only behaviour.
         return self._config_flag_enabled(self.data_download_config.get("tick_history_enabled", 1))
 
+    _SKIP_STALE_REFRESH_KWARGS = frozenset(
+        {"ztfx_skip_stale_refresh", "_skip_stale_refresh", "skip_stale_refresh"}
+    )
+
     def call_xtdata(self, rpc_name: str, *args, **kwargs):
+        skip_stale_refresh = any(
+            bool(kwargs.pop(key, False))
+            for key in self._SKIP_STALE_REFRESH_KWARGS
+            if key in kwargs
+        )
         period = self._arg_period(rpc_name, args, kwargs)
         if period == "tick" and not self._tick_history_enabled():
             if rpc_name in self._HISTORY_DOWNLOAD_METHODS:
@@ -742,7 +756,8 @@ class XtQuantBridge:
             kwargs = {**kwargs, "callback": self._make_download_progress_callback(rpc_name)}
         if rpc_name in self._DATA_FETCH_METHODS:
             result = self.xtdata_executor.call(rpc_name, *args, **kwargs)
-            result = self._refresh_stale_xtdata_result_if_needed(rpc_name, result, args, kwargs)
+            if not skip_stale_refresh:
+                result = self._refresh_stale_xtdata_result_if_needed(rpc_name, result, args, kwargs)
             self._log_data_fetch_result(rpc_name, result, kwargs)
         else:
             result = self.xtdata_executor.call(rpc_name, *args, **kwargs)

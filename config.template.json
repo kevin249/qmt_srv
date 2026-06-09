@@ -15,10 +15,15 @@
   "rpc": {
     "rep_address": "tcp://*:20140",
     "pub_address": "tcp://*:20141",
+    "trade_workers": 1,
+    "trade_queue_size": 16,
+    "trade_queue_timeout": 0.5,
     "fast_workers": 8,
     "fast_queue_size": 128,
+    "fast_queue_timeout": 3.0,
     "slow_workers": 2,
-    "slow_queue_size": 4
+    "slow_queue_size": 4,
+    "slow_queue_timeout": 10.0
   },
   "csv_data_source": {
     "path": "",

@@ -154,6 +154,11 @@ class XtQuantBridge:
         symbol_data = result.get(xt_symbol, []) if isinstance(result, dict) else []
         if hasattr(symbol_data, "to_dict"):
             return symbol_data.to_dict("records")
+        if isinstance(symbol_data, dict) and symbol_data.get("__type__") == "dataframe":
+            data = symbol_data.get("data", {})
+            columns = data.get("columns") or []
+            rows = data.get("data") or []
+            return [dict(zip(columns, row)) for row in rows] if columns else []
         if isinstance(symbol_data, list):
             return symbol_data
         return []
@@ -735,17 +740,132 @@ class XtQuantBridge:
 
         if rpc_name in ("xtdata.download_history_data2", "xtdata.download_history_data") and "callback" not in kwargs:
             kwargs = {**kwargs, "callback": self._make_download_progress_callback(rpc_name)}
-        result = self.xtdata_executor.call(rpc_name, *args, **kwargs)
-
         if rpc_name in self._DATA_FETCH_METHODS:
+            result = self.xtdata_executor.call(rpc_name, *args, **kwargs)
+            result = self._refresh_stale_xtdata_result_if_needed(rpc_name, result, args, kwargs)
             self._log_data_fetch_result(rpc_name, result, kwargs)
         else:
+            result = self.xtdata_executor.call(rpc_name, *args, **kwargs)
             self.log_info("rpc", "xtdata rpc done ...", method=rpc_name, result=self._summarize_xtdata_result(result))
 
         if self.csv_source is not None and rpc_name in self._DATA_FETCH_METHODS:
             result = self._csv_supplement_xtdata_result(result, kwargs)
 
         return result
+
+    def _refresh_stale_xtdata_result_if_needed(self, rpc_name: str, result: Any, args: tuple, kwargs: dict) -> Any:
+        period = self._arg_period(rpc_name, args, kwargs)
+        if not period or period == "tick":
+            return result
+
+        end_dt = parse_xt_timestamp(kwargs.get("end_time"))
+        if end_dt is None:
+            return result
+        requested_end = min(end_dt.astimezone(CHINA_TZ).date(), datetime.now(CHINA_TZ).date())
+
+        stale: list[tuple[str, date | None]] = []
+        for xt_symbol in self._arg_stock_list(rpc_name, args, kwargs):
+            rows = self._extract_history_rows(result, xt_symbol)
+            last_dt = self._last_row_datetime(rows)
+            if last_dt is None or last_dt.astimezone(CHINA_TZ).date() < requested_end:
+                stale.append((xt_symbol, last_dt.astimezone(CHINA_TZ).date() if last_dt else None))
+
+        if not stale:
+            return result
+
+        symbols = [item[0] for item in stale]
+        last_ranges = ", ".join(f"{symbol}:{last_day or 'none'}" for symbol, last_day in stale)
+        self.log_warning(
+            "history",
+            "QMT data shorter than requested; refreshing latest cache",
+            method=rpc_name,
+            period=period,
+            symbols=symbols,
+            qmt_last=last_ranges,
+            requested_end=requested_end,
+        )
+
+        refresh_start = self._refresh_start_time(stale, str(kwargs.get("start_time") or ""))
+        refresh_end = str(kwargs.get("end_time") or "")
+        try:
+            self._download_history(symbols, period, refresh_start, refresh_end, incrementally=True)
+        except Exception as exc:  # noqa: BLE001
+            self.log_warning(
+                "history",
+                "QMT latest cache refresh failed",
+                method=rpc_name,
+                period=period,
+                symbols=symbols,
+                error=exc,
+            )
+            return result
+
+        refreshed = self.xtdata_executor.call(rpc_name, *args, **kwargs)
+        refreshed_stale = []
+        for xt_symbol in symbols:
+            rows = self._extract_history_rows(refreshed, xt_symbol)
+            last_dt = self._last_row_datetime(rows)
+            if last_dt is None or last_dt.astimezone(CHINA_TZ).date() < requested_end:
+                refreshed_stale.append(f"{xt_symbol}:{last_dt.astimezone(CHINA_TZ).date() if last_dt else 'none'}")
+
+        if refreshed_stale:
+            self.log_warning(
+                "history",
+                "QMT data still shorter after refresh",
+                method=rpc_name,
+                period=period,
+                qmt_last=", ".join(refreshed_stale),
+                requested_end=requested_end,
+            )
+        else:
+            self.log_info("history", "QMT latest cache refresh applied", method=rpc_name, period=period, symbols=symbols)
+        return refreshed
+
+    @staticmethod
+    def _last_row_datetime(rows: list) -> datetime | None:
+        latest: datetime | None = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            dt = parse_xt_timestamp(row.get("time") or row.get("timestamp"))
+            if dt is None:
+                continue
+            dt = dt.astimezone(CHINA_TZ)
+            if latest is None or dt > latest:
+                latest = dt
+        return latest
+
+    @staticmethod
+    def _refresh_start_time(stale: list[tuple[str, date | None]], fallback_start: str) -> str:
+        known_dates = [last_day for _, last_day in stale if last_day is not None]
+        if not known_dates:
+            return fallback_start
+        return min(known_dates).strftime("%Y%m%d000000")
+
+    def _download_history(
+        self,
+        stock_list: list[str],
+        period: str,
+        start_time: str,
+        end_time: str,
+        *,
+        incrementally: bool | None = None,
+    ) -> Any:
+        callback = self._make_download_progress_callback("xtdata.download_history_data2")
+        if hasattr(self.xtdata, "download_history_data2"):
+            kwargs: dict[str, Any] = {"callback": callback}
+            if incrementally is not None:
+                kwargs["incrementally"] = incrementally
+            return self.xtdata.download_history_data2(stock_list, period, start_time, end_time, **kwargs)
+        if hasattr(self.xtdata, "download_history_data"):
+            result = None
+            for xt_symbol in stock_list:
+                kwargs = {}
+                if incrementally is not None:
+                    kwargs["incrementally"] = incrementally
+                result = self.xtdata.download_history_data(xt_symbol, period, start_time, end_time, **kwargs)
+            return result
+        raise RuntimeError("xtdata history download API is unavailable")
 
     def _log_data_fetch_request(self, rpc_name: str, args: tuple, kwargs: dict) -> None:
         period = kwargs.get("period", "")

@@ -115,14 +115,15 @@ class ConcurrentRpcServer:
             executor, slots = self._select_pool(str(name))
             if not slots.acquire(blocking=False):
                 kind = "slow" if str(name) in self._slow_methods else "fast"
-                message = (
-                    f"RpcServer busy: {kind} queue is full for {name!r}. "
-                    "Please retry later or reduce concurrent history/tick requests."
-                )
-                self._send_response(frames[:-1], [False, message])
+                self._send_response(frames[:-1], [False, self._queue_full_error(str(name), kind)])
                 continue
 
-            executor.submit(self._execute_request, frames[:-1], str(name), args, kwargs, slots)
+            try:
+                executor.submit(self._execute_request, frames[:-1], str(name), args, kwargs, slots)
+            except RuntimeError as exc:
+                slots.release()
+                message = f"RpcServer error: failed to enqueue {name!r}: {exc}"
+                self._send_response(frames[:-1], [False, message])
 
         self._socket_pub.close(0)
         self._socket_rep.close(0)
@@ -131,6 +132,13 @@ class ConcurrentRpcServer:
         if name in self._slow_methods:
             return self._slow_executor, self._slow_slots
         return self._fast_executor, self._fast_slots
+
+    @staticmethod
+    def _queue_full_error(name: str, kind: str) -> str:
+        return (
+            f"RpcServer busy: {kind} queue is full for {name!r}. "
+            "Please retry later or reduce concurrent history/tick requests."
+        )
 
     def _execute_request(
         self,

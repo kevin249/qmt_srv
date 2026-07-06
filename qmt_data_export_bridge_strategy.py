@@ -92,7 +92,13 @@ def _strategy_dir():
 
 
 def _runtime_config_path():
-    return os.path.join(_strategy_dir(), CONFIG_FILENAME)
+    primary = os.path.join(_strategy_dir(), CONFIG_FILENAME)
+    if os.path.exists(primary):
+        return primary
+    alternate = os.path.join(_qmt_root_dir(), "python", CONFIG_FILENAME)
+    if os.path.exists(alternate):
+        return alternate
+    return primary
 
 
 def _cfg_bool(value, default):
@@ -229,7 +235,7 @@ def _load_runtime_config(force=False):
 
 def _qmt_root_dir():
     path = _strategy_dir()
-    if os.path.basename(path).lower() == "python":
+    if os.path.basename(path).lower() in ("python", "bin.x64", "userdata", "userdata_mini"):
         return os.path.dirname(path)
     return path
 
@@ -260,7 +266,9 @@ def _output_root():
     dirname = str(OUTPUT_DIRNAME or "qmt_data_export").replace("{instance_id}", instance)
     if os.path.isabs(dirname):
         return os.path.abspath(os.path.expandvars(dirname))
-    return os.path.join(_strategy_dir(), dirname)
+    python_dir = os.path.join(_qmt_root_dir(), "python")
+    base_dir = python_dir if os.path.isdir(python_dir) else _strategy_dir()
+    return os.path.join(base_dir, dirname)
 
 
 def _path(*parts):
@@ -745,12 +753,14 @@ def _import_xtdata():
 
 
 def _safe_call(func, *args, **kwargs):
+    quiet = bool(kwargs.pop("_quiet", False))
     if not callable(func):
         return None
     try:
         return func(*args, **kwargs)
     except Exception as exc:
-        _log_error(getattr(func, "__name__", "call"), exc)
+        if not quiet:
+            _log_error(getattr(func, "__name__", "call"), exc)
         return None
 
 
@@ -784,8 +794,8 @@ def _collect_static(context):
     if xtdata is not None:
         start = (_now() - dt.timedelta(days=30)).strftime("%Y%m%d")
         end = (_now() + dt.timedelta(days=30)).strftime("%Y%m%d")
-        calendar["SH"] = _json_safe(_safe_call(getattr(xtdata, "get_trading_calendar", None), "SH", start, end) or [])
-        calendar["SZ"] = _json_safe(_safe_call(getattr(xtdata, "get_trading_calendar", None), "SZ", start, end) or [])
+        calendar["SH"] = _json_safe(_safe_call(getattr(xtdata, "get_trading_calendar", None), "SH", start, end, _quiet=True) or [])
+        calendar["SZ"] = _json_safe(_safe_call(getattr(xtdata, "get_trading_calendar", None), "SZ", start, end, _quiet=True) or [])
     with _LOCK:
         _CACHE["contracts"] = contracts
         _CACHE["financial"] = financial
@@ -1507,9 +1517,9 @@ def init(ContextInfo):
     _LAST_TRADE_AT = 0
     _ensure_dir(_output_root())
     _set_universe_safe(ContextInfo)
-    _write_support_inventory(ContextInfo)
-    _LAST_STATIC_AT = 0
     _collect_static(ContextInfo)
+    _write_support_inventory(ContextInfo)
+    _LAST_STATIC_AT = time.time()
     _subscribe(ContextInfo)
     _start_zmq()
     _collect(ContextInfo, "init")

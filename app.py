@@ -39,14 +39,50 @@ ADJUST_FOLDERS: dict[Any, str] = {
     2: "后复权",
 }
 MINUTE_PERIODS = {"tick", "1m", "5m", "15m", "30m", "60m", "1h"}
+DOWNLOAD_METHODS = {
+    "download_history_data",
+    "download_history_data2",
+    "xtdata.download_history_data",
+    "xtdata.download_history_data2",
+    "xtdata.download_financial_data",
+    "xtdata.download_financial_data2",
+}
+
+
+class MissingPickleObject:
+    value: Any = None
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+        obj = object.__new__(cls)
+        obj.args = args
+        obj.kwargs = kwargs
+        obj.value = args[0] if args else cls.__name__
+        return obj
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __setstate__(self, state: Any) -> None:
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+            if self.value is None:
+                self.value = state.get("value") or state.get("name") or state.get("_name_")
+
+    def __str__(self) -> str:
+        return str(self.value or self.__class__.__name__)
+
+    def __repr__(self) -> str:
+        return str(self)
 
 
 class LooseUnpickler(pickle.Unpickler):
     def find_class(self, module: str, name: str) -> type[Any]:
+        if module.startswith("vnpy."):
+            return type(str(name), (MissingPickleObject,), {"__module__": module})
         try:
             return super().find_class(module, name)
         except Exception:
-            return type(str(name), (object,), {})
+            return type(str(name), (MissingPickleObject,), {"__module__": module})
 
 
 @dataclass
@@ -70,13 +106,17 @@ def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
-def read_json(path: Path, default: Any) -> Any:
+def read_json(path: Path, default: Any, *, strict: bool = False) -> Any:
     try:
         text = path.read_text(encoding="utf-8-sig")
         return json.loads(strip_json_comments(text))
     except FileNotFoundError:
+        if strict:
+            raise
         return default
     except Exception as exc:
+        if strict:
+            raise ValueError(f"failed to parse JSON file {path}: {exc}") from exc
         print(f"QMT_SRV_JSON_IGNORED path={path} error={exc}", file=sys.stderr)
         return default
 
@@ -446,9 +486,9 @@ def normalize_instances(config: dict[str, Any]) -> list[QmtInstance]:
 
 def load_config(config_path: Path | None) -> dict[str, Any]:
     path = config_path or (DEFAULT_CONFIG_PATH if DEFAULT_CONFIG_PATH.exists() else TEMPLATE_CONFIG_PATH)
-    config = read_json(path, {})
+    config = read_json(path, {}, strict=True)
     if not isinstance(config, dict):
-        config = {}
+        raise ValueError(f"config root must be a JSON object: {path}")
     rpc_config = config.get("rpc") if isinstance(config.get("rpc"), dict) else {}
     if "rep_address" not in config and rpc_config.get("rep_address"):
         config["rep_address"] = rpc_config["rep_address"]
@@ -617,8 +657,11 @@ def decode_rpc(raw: bytes) -> tuple[str, list[Any], dict[str, Any]]:
     except Exception:
         try:
             obj = LooseUnpickler(io.BytesIO(raw)).load()
-        except Exception:
-            obj = json.loads(raw.decode("utf-8"))
+        except Exception as loose_exc:
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except Exception as json_exc:
+                raise ValueError(f"failed to decode RPC request as pickle or JSON: {loose_exc}") from json_exc
     if isinstance(obj, (list, tuple)) and len(obj) >= 3:
         return str(obj[0]), list(obj[1] or []), dict(obj[2] or {})
     if isinstance(obj, dict):
@@ -823,6 +866,8 @@ class QmtSrv:
         if method == "query_history":
             self.route_command(method, args, kwargs)
             return self.query_history(args[0] if args else kwargs, aggregate)
+        if method in DOWNLOAD_METHODS:
+            return True
         if method in {"get_tick", "get_l1_tick"}:
             symbol = normalize_symbol(args[0] if args else kwargs.get("vt_symbol") or kwargs.get("symbol"))
             return aggregate["ticks"].get(symbol)
@@ -977,7 +1022,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except Exception as exc:
+        print(f"QMT_SRV_CONFIG_ERROR: {exc}", file=sys.stderr)
+        return 2
     service = QmtSrv(config)
     if not service.instances:
         print("QMT_SRV_NO_INSTANCES: configure qmt_instances in config.user.json", file=sys.stderr)

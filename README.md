@@ -149,6 +149,8 @@ sock.send_pyobj(["subscribe", [{"vt_symbol": "600460.SH"}], {"qmt_path": "D:\\�
 
 脚本会把 GBK 编码的 `qmt_data_export_bridge_strategy.py` 复制到每个 QMT `python` 目录，并生成该 QMT 专用的 `qmt_data_export_bridge_config.json`。这个配置只包含实例名、账号和命令文件设置，不会给每个 QMT 单独设置对外端口。
 
+如果 QMT 日志里出现 `instance=bin.x64` 或导出目录落在 `bin.x64\qmt_data_export`，说明 QMT 正在运行旧策略或没有读到同步脚本生成的运行配置。重新执行上面的同步脚本，并在 QMT 里重新加载策略。新版策略即使从 `bin.x64` 启动，也会优先把数据导出到 QMT 根目录下的 `python\qmt_data_export`，和 qmt_srv 读取目录保持一致。
+
 ## 启动
 
 先在每个 QMT 客户端里运行策略 `qmt_data_export_bridge_strategy.py`，再启动唯一的服务：
@@ -191,6 +193,8 @@ uv venv --python 3.13 .venv
 uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
 ```
 
+新版 `start.bat` 会自动做这个重建步骤。注意 `uv run app.py` 会复用当前坏掉的 `.venv`，不会自动修复；如果要继续用 `uv run`，先删除并重建 `.venv`。
+
 ## 旧接口兼容
 
 已支持的常用方法包括：
@@ -210,5 +214,6 @@ uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
 - `xtdata.get_trading_calendar`
 - `xtdata.get_stock_list_in_sector`
 - `xtdata.subscribe_quote` / `xtdata.subscribe_whole_quote`
+- `xtdata.download_history_data` / `xtdata.download_history_data2`：兼容旧调用并返回成功；qmt_srv 不再执行 xtdata 直连下载，历史读取继续走 `csv_data_source.path` 和 QMT 策略导出
 
 交易下单接口仍然禁用：`send_order` 和 `cancel_order` 会返回只读错误，避免误连真实账户。

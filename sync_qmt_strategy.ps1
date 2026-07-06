@@ -76,6 +76,7 @@ foreach ($Instance in $Instances) {
 
     $RuntimeConfig = [ordered]@{
         instance_id = $InstanceId
+        output_root = (Join-Path $PythonDir "qmt_data_export")
         output_dirname = "qmt_data_export"
         command_filename = "inbox.jsonl"
         symbols = @()

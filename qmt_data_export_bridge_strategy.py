@@ -49,6 +49,7 @@ BRIDGE_PUSH_SECONDS = 1.0
 FILE_OUTPUT_ENABLED = True
 _FILE_OUTPUT_DISABLED = False
 _FILE_OUTPUT_DISABLE_LOGGED = False
+_BOOTSTRAP_INIT_CALLED = False
 _LAST_BRIDGE_PUSH_AT = 0
 _LAST_BRIDGE_ERROR_AT = 0
 
@@ -1727,8 +1728,9 @@ def _collect(context, source):
 
 
 def init(ContextInfo):
-    global _CONTEXT, _LAST_STATIC_AT, _LAST_TRADE_AT
+    global _CONTEXT, _LAST_STATIC_AT, _LAST_TRADE_AT, _BOOTSTRAP_INIT_CALLED
     print("QMT_DATA_EXPORT_INIT_ENTER version=%s file=%s" % (BRIDGE_VERSION, globals().get("__file__", "")))
+    _BOOTSTRAP_INIT_CALLED = True
     _CONTEXT = ContextInfo
     _load_runtime_config(force=True)
     _LAST_TRADE_AT = 0
@@ -1764,3 +1766,20 @@ def stop(ContextInfo):
     print("QMT_DATA_EXPORT_STOP ticks=%s bars=%s rpc=%s errors=%s" % (
         _ROW_COUNTS["ticks"], _ROW_COUNTS["bars"], _ROW_COUNTS["rpc"], _ROW_COUNTS["errors"]
     ))
+
+
+def _bootstrap_from_global_context():
+    if _BOOTSTRAP_INIT_CALLED:
+        return
+    context = globals().get("ContextInfo")
+    if context is None:
+        print("QMT_DATA_EXPORT_BOOTSTRAP_NO_CONTEXT version=%s file=%s" % (BRIDGE_VERSION, globals().get("__file__", "")))
+        return
+    try:
+        print("QMT_DATA_EXPORT_BOOTSTRAP_CONTEXT version=%s file=%s" % (BRIDGE_VERSION, globals().get("__file__", "")))
+        init(context)
+    except Exception as exc:
+        _log_error("bootstrap_context", exc)
+
+
+_bootstrap_from_global_context()

@@ -152,6 +152,8 @@ sock.send_pyobj(["subscribe", [{"vt_symbol": "600460.SH"}], {"qmt_path": "D:\\�
 
 如果 QMT 日志里没有 `QMT_DATA_EXPORT_MODULE_LOADED` 和 `QMT_DATA_EXPORT_INIT_ENTER`，说明 QMT 没有加载到新版桥接策略。重新执行上面的同步脚本，并在 QMT 里选择 `qmt_data_export_bridge_strategy.py` 或 `QMT_BRIDGE.py` 重新加载。
 
+如果日志只有 `QMT_DATA_EXPORT_MODULE_LOADED`，但没有 `QMT_DATA_EXPORT_INIT_ENTER`，说明当前运行环境只导入了策略脚本，没有调用 QMT 策略生命周期。新版策略会额外打印 `QMT_DATA_EXPORT_BOOTSTRAP_CONTEXT` 或 `QMT_DATA_EXPORT_BOOTSTRAP_NO_CONTEXT`：前者表示原厂服务器提供了全局 `ContextInfo`，策略会自动进入采集；后者表示没有可用策略上下文，这种模式下无法从脚本内读取行情/账号数据，需要改为在本机 QMT 客户端策略环境中运行。
+
 如果 QMT 日志里出现 `instance=bin.x64` 或导出目录落在 `bin.x64\qmt_data_export`，说明 QMT 正在运行旧策略或没有读到同步脚本生成的运行配置。重新执行上面的同步脚本，并在 QMT 里重新加载策略。新版策略即使从 `bin.x64` 启动，也会优先把数据导出到 QMT 根目录下的 `python\qmt_data_export`，和 qmt_srv 读取目录保持一致。
 
 如果 QMT 日志里出现 `PermissionError: Foribdden FileIO`，说明当前策略沙箱禁止直接写 CSV/JSON。新版策略会打印一次 `QMT_DATA_EXPORT_FILE_OUTPUT_DISABLED`，随后继续通过 qmt_srv 桥接上报内存快照；这时本地 CSV 可能不会生成，但旧 REP/PUB 查询仍可从 qmt_srv 的内存快照读取实时数据。

@@ -701,6 +701,7 @@ class QmtSrv:
         )
         self.clients: dict[str, dict[str, Any]] = {}
         self.bridge_snapshots: dict[str, dict[str, Any]] = {}
+        self.pending_bridge_commands: dict[str, list[dict[str, Any]]] = {}
         self.bridge_snapshot_ttl = float(config.get("bridge_snapshot_ttl_seconds") or 30.0)
         self.bridge_pipe_address = str(config.get("bridge_pipe_address") or r"\\.\pipe\qmt_srv_bridge")
         self.bridge_pipe_authkey = str(config.get("bridge_pipe_authkey") or "qmt_srv_bridge").encode("utf-8")
@@ -750,7 +751,17 @@ class QmtSrv:
         safe_snapshot["transport"] = "qmt_bridge"
         self.bridge_snapshots[instance_id] = safe_snapshot
         self.persist_bridge_snapshot(instance_id, safe_snapshot)
-        return {"ok": True, "instance_id": instance_id, "commands": []}
+        fetch_commands = bool(kwargs.get("fetch_commands", True))
+        commands = self.pending_bridge_commands.pop(instance_id, []) if fetch_commands else []
+        if incoming_instance_id and incoming_instance_id != instance_id:
+            routed_commands = []
+            for command in commands:
+                routed = dict(command)
+                routed["server_instance_id"] = instance_id
+                routed["instance_id"] = incoming_instance_id
+                routed_commands.append(routed)
+            commands = routed_commands
+        return {"ok": True, "instance_id": instance_id, "commands": commands}
 
     def persist_bridge_snapshot(self, instance_id: str, snapshot: dict[str, Any]) -> None:
         instance = next((item for item in self.instances if item.instance_id == instance_id), None)
@@ -941,7 +952,6 @@ class QmtSrv:
         return [item for item in self.instances if self._matches_instance(item, wanted, wanted_paths)]
 
     def write_command(self, instance: QmtInstance, method: str, args: list[Any], kwargs: dict[str, Any]) -> dict[str, Any]:
-        instance.command_file.parent.mkdir(parents=True, exist_ok=True)
         command = {
             "id": str(uuid.uuid4()),
             "time": now_text(),
@@ -950,9 +960,15 @@ class QmtSrv:
             "args": json_safe(args),
             "kwargs": json_safe(kwargs),
         }
-        with instance.command_file.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(command, ensure_ascii=False, sort_keys=True))
-            fh.write("\n")
+        self.pending_bridge_commands.setdefault(instance.instance_id, []).append(command)
+        self.pending_bridge_commands[instance.instance_id] = self.pending_bridge_commands[instance.instance_id][-200:]
+        try:
+            instance.command_file.parent.mkdir(parents=True, exist_ok=True)
+            with instance.command_file.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(command, ensure_ascii=False, sort_keys=True))
+                fh.write("\n")
+        except Exception as exc:
+            print(f"QMT_SRV_COMMAND_FILE_WRITE_ERROR instance_id={instance.instance_id} error={exc}", file=sys.stderr)
         return command
 
     def route_command(self, method: str, args: list[Any], kwargs: dict[str, Any]) -> list[dict[str, Any]]:

@@ -16,6 +16,7 @@ OUTPUT_DIRNAME = "qmt_data_export"
 OUTPUT_ROOT = ""
 INSTANCE_ID = ""
 CONFIG_FILENAME = "qmt_data_export_bridge_config.json"
+EMBEDDED_CONFIG_JSON = ""
 COMMAND_FILENAME = "inbox.jsonl"
 DIVIDEND_TYPE = "front"
 ACCOUNT_ID = ""
@@ -50,6 +51,7 @@ FILE_OUTPUT_ENABLED = True
 _FILE_OUTPUT_DISABLED = False
 _FILE_OUTPUT_DISABLE_LOGGED = False
 _BOOTSTRAP_INIT_CALLED = False
+_INIT_COMPLETED = False
 _LAST_BRIDGE_PUSH_AT = 0
 _LAST_BRIDGE_ERROR_AT = 0
 
@@ -91,6 +93,7 @@ _PUB_SOCKET = None
 _ZMQ = None
 _CONFIG_LOADED = False
 _CONFIG = {}
+_CONFIG_IGNORED_LOGGED = False
 
 
 def _now():
@@ -149,8 +152,20 @@ def _cfg_list(value):
     return [value]
 
 
+def _log_config_ignored(path, exc):
+    global _CONFIG_IGNORED_LOGGED
+    if _CONFIG_IGNORED_LOGGED:
+        return
+    _CONFIG_IGNORED_LOGGED = True
+    print("QMT_DATA_EXPORT_CONFIG_IGNORED path=%s error=%s" % (path, exc))
+
+
 def _read_config_json(path):
-    if not os.path.exists(path):
+    try:
+        if not os.path.exists(path):
+            return {}
+    except Exception as exc:
+        _log_config_ignored(path, exc)
         return {}
     last_error = None
     for enc in ("utf-8-sig", "utf-8", "gbk"):
@@ -160,7 +175,7 @@ def _read_config_json(path):
             return data if isinstance(data, dict) else {}
         except Exception as exc:
             last_error = exc
-    print("QMT_DATA_EXPORT_CONFIG_IGNORED path=%s error=%s" % (path, last_error))
+    _log_config_ignored(path, last_error)
     return {}
 
 
@@ -174,6 +189,14 @@ def _load_runtime_config(force=False):
         return _CONFIG
     _CONFIG_LOADED = True
     config = _read_config_json(_runtime_config_path())
+    if not config and EMBEDDED_CONFIG_JSON:
+        try:
+            embedded = json.loads(EMBEDDED_CONFIG_JSON)
+            if isinstance(embedded, dict):
+                config = embedded
+                print("QMT_DATA_EXPORT_CONFIG_EMBEDDED loaded=1")
+        except Exception as exc:
+            print("QMT_DATA_EXPORT_CONFIG_EMBEDDED_IGNORED error=%s" % exc)
     _CONFIG = config
     if not config:
         return _CONFIG
@@ -882,6 +905,21 @@ def _safe_call(func, *args, **kwargs):
         return None
 
 
+def _get_stock_list_in_sector(context, name):
+    getter = getattr(context, "get_stock_list_in_sector", None)
+    if callable(getter):
+        for args in ((name, 0), (name,)):
+            data = _safe_call(getter, *args, _quiet=True)
+            if data is not None:
+                return data
+    xtdata = _import_xtdata()
+    if xtdata is not None:
+        data = _safe_call(getattr(xtdata, "get_stock_list_in_sector", None), name, _quiet=True)
+        if data is not None:
+            return data
+    return None
+
+
 def _collect_static(context):
     xtdata = _import_xtdata()
     contracts = {}
@@ -902,10 +940,7 @@ def _collect_static(context):
     sectors = {}
     sector_names = ["沪深A股", "上证A股", "深证A股", "创业板", "科创板"]
     for name in sector_names:
-        getter = getattr(context, "get_stock_list_in_sector", None)
-        data = _safe_call(getter, name) if callable(getter) else None
-        if data is None and xtdata is not None:
-            data = _safe_call(getattr(xtdata, "get_stock_list_in_sector", None), name)
+        data = _get_stock_list_in_sector(context, name)
         if data is not None:
             sectors[name] = _json_safe(data)
     calendar = {}
@@ -1486,6 +1521,35 @@ def _bridge_call(method, args=None, kwargs=None):
     return None
 
 
+
+def _process_bridge_commands(commands):
+    if not isinstance(commands, (list, tuple)):
+        return 0
+    count = 0
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        try:
+            target = str(command.get("instance_id") or command.get("target_instance_id") or "").strip()
+            if target and target not in ("*", "all", _instance_id()):
+                continue
+            method = command.get("method") or command.get("function")
+            args = command.get("args") or []
+            kwargs = command.get("kwargs") or {}
+            payload = _legacy_rpc_call(method, args, kwargs)
+            _append_command_ack(command, True, payload, "")
+            _ROW_COUNTS["commands"] += 1
+            count += 1
+        except Exception as exc:
+            try:
+                _append_command_ack(command, False, None, str(exc))
+            except Exception:
+                pass
+            _log_error("process_bridge_command", exc)
+    if count:
+        print("QMT_DATA_EXPORT_BRIDGE_COMMANDS count=%s" % count)
+    return count
+
 def _push_bridge_snapshot(source="", force=False):
     global _LAST_BRIDGE_PUSH_AT
     if not BRIDGE_ENABLED:
@@ -1499,8 +1563,15 @@ def _push_bridge_snapshot(source="", force=False):
     response = _bridge_call("qmt_bridge.update", [payload], {"instance_id": _instance_id()})
     ok = isinstance(response, (list, tuple)) and len(response) >= 1 and bool(response[0])
     if ok:
+        response_payload = response[1] if len(response) > 1 and isinstance(response[1], dict) else {}
+        command_count = _process_bridge_commands(response_payload.get("commands") or [])
+        if command_count:
+            _write_snapshots(force=True)
+            updated_payload = _snapshot_payload()
+            updated_payload["bridge_source"] = "%s:commands" % source
+            _bridge_call("qmt_bridge.update", [updated_payload], {"instance_id": _instance_id(), "fetch_commands": False})
         with _LOCK:
-            _CACHE["network"] = {"enabled": True, "mode": "client", "rep": BRIDGE_REP_ADDRESS, "pipe": BRIDGE_PIPE_ADDRESS, "last_push": _now_text()}
+            _CACHE["network"] = {"enabled": True, "mode": "client", "rep": BRIDGE_REP_ADDRESS, "pipe": BRIDGE_PIPE_ADDRESS, "last_push": _now_text(), "last_commands": command_count}
     return ok
 
 
@@ -1728,10 +1799,13 @@ def _collect(context, source):
 
 
 def init(ContextInfo):
-    global _CONTEXT, _LAST_STATIC_AT, _LAST_TRADE_AT, _BOOTSTRAP_INIT_CALLED
+    global _CONTEXT, _LAST_STATIC_AT, _LAST_TRADE_AT, _BOOTSTRAP_INIT_CALLED, _INIT_COMPLETED
     print("QMT_DATA_EXPORT_INIT_ENTER version=%s file=%s" % (BRIDGE_VERSION, globals().get("__file__", "")))
     _BOOTSTRAP_INIT_CALLED = True
     _CONTEXT = ContextInfo
+    if _INIT_COMPLETED:
+        print("QMT_DATA_EXPORT_INIT_SKIPPED_DUPLICATE version=%s file=%s" % (BRIDGE_VERSION, globals().get("__file__", "")))
+        return
     _load_runtime_config(force=True)
     _LAST_TRADE_AT = 0
     _ensure_dir(_output_root())
@@ -1744,6 +1818,7 @@ def init(ContextInfo):
     _collect(ContextInfo, "init")
     _write_snapshots(force=True)
     _push_bridge_snapshot("init", force=True)
+    _INIT_COMPLETED = True
     print("QMT_DATA_EXPORT_INIT instance=%s symbols=%s accounts=%s output=%s" % (_instance_id(), ",".join(_symbols()), ",".join([a.get("account_id", "") for a in _trade_accounts(ContextInfo)]), _output_root()))
 
 

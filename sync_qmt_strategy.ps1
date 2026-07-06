@@ -19,6 +19,7 @@ if ($UseTemplate -or -not (Test-Path -LiteralPath $ConfigPath)) {
 $ConfigFullPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $Config = Get-Content -LiteralPath $ConfigFullPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $Instances = @($Config.qmt_instances)
+$GbkEncoding = [System.Text.Encoding]::GetEncoding(936)
 $BridgeRepAddress = "tcp://127.0.0.1:20140"
 if ($Config.rpc -and $Config.rpc.rep_address) {
     $BridgeRepAddress = ([string]$Config.rpc.rep_address).Replace("tcp://*:", "tcp://127.0.0.1:").Replace("tcp://0.0.0.0:", "tcp://127.0.0.1:")
@@ -63,8 +64,6 @@ foreach ($Instance in $Instances) {
 
     $StrategyTarget = Join-Path $PythonDir "qmt_data_export_bridge_strategy.py"
     $StrategyAliasTarget = Join-Path $PythonDir "QMT_BRIDGE.py"
-    Copy-Item -LiteralPath $StrategySource -Destination $StrategyTarget -Force
-    Copy-Item -LiteralPath $StrategySource -Destination $StrategyAliasTarget -Force
 
     $RuntimeAccounts = @()
     foreach ($Account in @($Instance.accounts)) {
@@ -101,7 +100,20 @@ foreach ($Instance in $Instances) {
     }
 
     $RuntimeConfigPath = Join-Path $PythonDir "qmt_data_export_bridge_config.json"
+    $RuntimeConfigJson = $RuntimeConfig | ConvertTo-Json -Depth 10 -Compress
     $RuntimeConfig | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $RuntimeConfigPath -Encoding UTF8
+
+    if ($RuntimeConfigJson.Contains("'''")) {
+        throw "Runtime config contains unsupported triple-quote sequence for $InstanceId"
+    }
+    $StrategyText = [System.IO.File]::ReadAllText($StrategySource, $GbkEncoding)
+    $EmbeddedLine = "EMBEDDED_CONFIG_JSON = r'''$RuntimeConfigJson'''"
+    if (-not $StrategyText.Contains('EMBEDDED_CONFIG_JSON = ""')) {
+        throw "Strategy source is missing EMBEDDED_CONFIG_JSON placeholder"
+    }
+    $StrategyText = $StrategyText.Replace('EMBEDDED_CONFIG_JSON = ""', $EmbeddedLine)
+    [System.IO.File]::WriteAllText($StrategyTarget, $StrategyText, $GbkEncoding)
+    [System.IO.File]::WriteAllText($StrategyAliasTarget, $StrategyText, $GbkEncoding)
 
     Write-Host "synced $InstanceId -> $StrategyTarget"
     Write-Host "synced $InstanceId -> $StrategyAliasTarget"

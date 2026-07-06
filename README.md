@@ -21,6 +21,12 @@
 Copy-Item config.template.json config.user.json
 ```
 
+多账号示例可以直接看 `config.multi_account.example.json`。如果要从示例开始改：
+
+```powershell
+Copy-Item config.multi_account.example.json config.user.json
+```
+
 在 `config.user.json` 里维护多个 QMT 目录和账号：
 
 ```json
@@ -34,6 +40,33 @@ Copy-Item config.template.json config.user.json
       "accounts": [
         { "account_id": "你的账号1", "account_type": "STOCK", "name": "main" },
         { "account_id": "你的账号2", "account_type": "STOCK", "name": "backup" }
+      ]
+    }
+  ]
+}
+```
+
+两个 QMT 同时管理时，第二个 QMT 继续加在 `qmt_instances` 数组里：
+
+```json
+{
+  "rep_address": "tcp://*:20140",
+  "pub_address": "tcp://*:20141",
+  "snapshot_publish_seconds": 1.0,
+  "qmt_instances": [
+    {
+      "instance_id": "ctsec_main",
+      "python_dir": "D:\\迅投QMT交易终端财通证券版\\python",
+      "accounts": [
+        { "account_id": "10000001", "account_type": "STOCK", "name": "main" },
+        { "account_id": "10000002", "account_type": "STOCK", "name": "backup" }
+      ]
+    },
+    {
+      "instance_id": "ctsec_second",
+      "python_dir": "D:\\第二个QMT交易终端\\python",
+      "accounts": [
+        { "account_id": "20000001", "account_type": "STOCK", "name": "second-main" }
       ]
     }
   ]

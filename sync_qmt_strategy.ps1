@@ -19,6 +19,10 @@ if ($UseTemplate -or -not (Test-Path -LiteralPath $ConfigPath)) {
 $ConfigFullPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $Config = Get-Content -LiteralPath $ConfigFullPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $Instances = @($Config.qmt_instances)
+$BridgeRepAddress = "tcp://127.0.0.1:20140"
+if ($Config.rpc -and $Config.rpc.rep_address) {
+    $BridgeRepAddress = ([string]$Config.rpc.rep_address).Replace("tcp://*:", "tcp://127.0.0.1:").Replace("tcp://0.0.0.0:", "tcp://127.0.0.1:")
+}
 
 if ($Instances.Count -eq 0) {
     throw "No qmt_instances found in $ConfigFullPath"
@@ -83,6 +87,14 @@ foreach ($Instance in $Instances) {
         accounts = @($RuntimeAccounts)
         legacy_zmq = [ordered]@{
             enabled = $false
+        }
+        bridge = [ordered]@{
+            enabled = $true
+            rep_address = $BridgeRepAddress
+            pipe_address = "\\.\pipe\qmt_srv_bridge"
+            authkey = "qmt_srv_bridge"
+            timeout_ms = 300
+            push_seconds = 1.0
         }
     }
 

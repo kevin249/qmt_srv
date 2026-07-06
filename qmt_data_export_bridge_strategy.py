@@ -34,6 +34,18 @@ ENABLE_LEGACY_ZMQ = False
 LEGACY_REP_ADDRESS = "tcp://*:20140"
 LEGACY_PUB_ADDRESS = "tcp://*:20141"
 
+BRIDGE_ENABLED = True
+BRIDGE_REP_ADDRESS = "tcp://127.0.0.1:20140"
+BRIDGE_PIPE_ADDRESS = r"\\.\pipe\qmt_srv_bridge"
+BRIDGE_AUTHKEY = "qmt_srv_bridge"
+BRIDGE_TIMEOUT_MS = 300
+BRIDGE_PUSH_SECONDS = 1.0
+FILE_OUTPUT_ENABLED = True
+_FILE_OUTPUT_DISABLED = False
+_FILE_OUTPUT_DISABLE_LOGGED = False
+_LAST_BRIDGE_PUSH_AT = 0
+_LAST_BRIDGE_ERROR_AT = 0
+
 BAR_FIELDS = ["time", "open", "high", "low", "close", "volume", "amount"]
 TICK_COLUMNS = [
     "local_dt", "source", "symbol", "tick_time", "tick_dt", "last_price", "open", "high", "low",
@@ -61,6 +73,8 @@ _LAST_SNAPSHOT_AT = 0
 _LAST_STATIC_AT = 0
 _LAST_TRADE_AT = 0
 _COMMAND_OFFSET = 0
+_COMMAND_FILE_DISABLED = False
+_COMMAND_FILE_DISABLE_LOGGED = False
 _ROW_COUNTS = {"ticks": 0, "bars": 0, "events": 0, "rpc": 0, "commands": 0, "errors": 0}
 _ZMQ_THREAD = None
 _ZMQ_STOP = threading.Event()
@@ -148,6 +162,7 @@ def _load_runtime_config(force=False):
     global DIVIDEND_TYPE, ACCOUNT_ID, ACCOUNT_TYPE, ACCOUNT_IDS, ACCOUNT_CONFIGS
     global HISTORY_PERIODS, HISTORY_COUNT, STATIC_REFRESH_SECONDS, SNAPSHOT_REFRESH_SECONDS, TRADE_REFRESH_SECONDS
     global WRITE_DUPLICATE_TICKS, SUBSCRIBE_TICK_IN_INIT, ENABLE_LEGACY_ZMQ, LEGACY_REP_ADDRESS, LEGACY_PUB_ADDRESS
+    global BRIDGE_ENABLED, BRIDGE_REP_ADDRESS, BRIDGE_PIPE_ADDRESS, BRIDGE_AUTHKEY, BRIDGE_TIMEOUT_MS, BRIDGE_PUSH_SECONDS, FILE_OUTPUT_ENABLED
     if _CONFIG_LOADED and not force:
         return _CONFIG
     _CONFIG_LOADED = True
@@ -230,6 +245,45 @@ def _load_runtime_config(force=False):
         value = legacy.get("pub_address", missing)
     if value is not missing and value:
         LEGACY_PUB_ADDRESS = str(value)
+    bridge = config.get("bridge") or config.get("qmt_srv_bridge") or {}
+    if not isinstance(bridge, dict):
+        bridge = {}
+    value = pick("bridge_enabled")
+    if value is missing:
+        value = bridge.get("enabled", missing)
+    if value is not missing:
+        BRIDGE_ENABLED = _cfg_bool(value, BRIDGE_ENABLED)
+    value = pick("bridge_rep_address")
+    if value is missing:
+        value = bridge.get("rep_address", missing)
+    if value is not missing and value:
+        BRIDGE_REP_ADDRESS = str(value)
+    value = pick("bridge_pipe_address")
+    if value is missing:
+        value = bridge.get("pipe_address", missing)
+    if value is not missing and value:
+        BRIDGE_PIPE_ADDRESS = str(value)
+    value = pick("bridge_authkey")
+    if value is missing:
+        value = bridge.get("authkey", missing)
+    if value is not missing and value:
+        BRIDGE_AUTHKEY = str(value)
+    value = pick("bridge_timeout_ms")
+    if value is missing:
+        value = bridge.get("timeout_ms", missing)
+    if value is not missing:
+        BRIDGE_TIMEOUT_MS = _cfg_int(value, BRIDGE_TIMEOUT_MS)
+    value = pick("bridge_push_seconds")
+    if value is missing:
+        value = bridge.get("push_seconds", missing)
+    if value is not missing:
+        try:
+            BRIDGE_PUSH_SECONDS = float(value)
+        except Exception:
+            pass
+    value = pick("file_output_enabled")
+    if value is not missing:
+        FILE_OUTPUT_ENABLED = _cfg_bool(value, FILE_OUTPUT_ENABLED)
     return _CONFIG
 
 
@@ -275,15 +329,42 @@ def _path(*parts):
     return os.path.join(_output_root(), *parts)
 
 
+def _is_forbidden_fileio(exc):
+    text = str(exc or "").lower()
+    return "foribdden fileio" in text or "forbidden fileio" in text
+
+
+def _disable_file_output(where, exc):
+    global _FILE_OUTPUT_DISABLED, _FILE_OUTPUT_DISABLE_LOGGED
+    _FILE_OUTPUT_DISABLED = True
+    if not _FILE_OUTPUT_DISABLE_LOGGED:
+        _FILE_OUTPUT_DISABLE_LOGGED = True
+        print("QMT_DATA_EXPORT_FILE_OUTPUT_DISABLED where=%s error=%s" % (where, exc))
+
+
+def _file_output_available():
+    return bool(FILE_OUTPUT_ENABLED) and not _FILE_OUTPUT_DISABLED
+
+
 def _ensure_dir(path):
-    if path and not os.path.isdir(path):
-        os.makedirs(path)
+    if not _file_output_available():
+        return False
+    try:
+        if path and not os.path.isdir(path):
+            os.makedirs(path)
+        return True
+    except Exception as exc:
+        if _is_forbidden_fileio(exc):
+            _disable_file_output("ensure_dir", exc)
+            return False
+        raise
 
 
 def _ensure_parent(path):
     parent = os.path.dirname(path)
     if parent:
-        _ensure_dir(parent)
+        return _ensure_dir(parent)
+    return True
 
 
 def _json_safe(value, depth=0):
@@ -322,34 +403,64 @@ def _json_safe(value, depth=0):
 
 
 def _write_json(path, payload):
-    _ensure_parent(path)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(_json_safe(payload), fh, ensure_ascii=False, indent=2, sort_keys=True)
-    if os.path.exists(path):
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-    os.rename(tmp, path)
+    if not _file_output_available():
+        return False
+    try:
+        if not _ensure_parent(path):
+            return False
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_json_safe(payload), fh, ensure_ascii=False, indent=2, sort_keys=True)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        os.rename(tmp, path)
+        return True
+    except Exception as exc:
+        if _is_forbidden_fileio(exc):
+            _disable_file_output("write_json", exc)
+            return False
+        raise
 
 
 def _append_jsonl(path, payload):
-    _ensure_parent(path)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(_json_safe(payload), ensure_ascii=False, sort_keys=True))
-        fh.write("\n")
+    if not _file_output_available():
+        return False
+    try:
+        if not _ensure_parent(path):
+            return False
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(_json_safe(payload), ensure_ascii=False, sort_keys=True))
+            fh.write("\n")
+        return True
+    except Exception as exc:
+        if _is_forbidden_fileio(exc):
+            _disable_file_output("append_jsonl", exc)
+            return False
+        raise
 
 
 def _append_csv(path, row, columns):
-    _ensure_parent(path)
-    has_header = os.path.exists(path) and os.path.getsize(path) > 0
-    with open(path, "a", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
-        if not has_header:
-            writer.writeheader()
-        writer.writerow(row)
-        fh.flush()
+    if not _file_output_available():
+        return False
+    try:
+        if not _ensure_parent(path):
+            return False
+        has_header = os.path.exists(path) and os.path.getsize(path) > 0
+        with open(path, "a", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+            if not has_header:
+                writer.writeheader()
+            writer.writerow(row)
+            fh.flush()
+        return True
+    except Exception as exc:
+        if _is_forbidden_fileio(exc):
+            _disable_file_output("append_csv", exc)
+            return False
+        raise
 
 
 def _log_error(where, exc):
@@ -1307,6 +1418,85 @@ def _publish(topic, payload):
         pass
 
 
+def _bridge_should_report_error():
+    global _LAST_BRIDGE_ERROR_AT
+    now = time.time()
+    if now - _LAST_BRIDGE_ERROR_AT >= 30:
+        _LAST_BRIDGE_ERROR_AT = now
+        return True
+    return False
+
+
+def _bridge_call_zmq(method, args=None, kwargs=None):
+    import zmq
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.REQ)
+    sock.linger = 0
+    timeout = max(50, int(BRIDGE_TIMEOUT_MS or 300))
+    sock.rcvtimeo = timeout
+    sock.sndtimeo = timeout
+    try:
+        sock.connect(BRIDGE_REP_ADDRESS)
+        sock.send_pyobj([method, args or [], kwargs or {}])
+        return sock.recv_pyobj()
+    finally:
+        try:
+            sock.close(0)
+        except Exception:
+            pass
+
+
+def _bridge_call_pipe(method, args=None, kwargs=None):
+    from multiprocessing.connection import Client
+    authkey = str(BRIDGE_AUTHKEY or "qmt_srv_bridge").encode("utf-8")
+    conn = Client(BRIDGE_PIPE_ADDRESS, family="AF_PIPE", authkey=authkey)
+    try:
+        conn.send([method, args or [], kwargs or {}])
+        return conn.recv()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _bridge_call(method, args=None, kwargs=None):
+    if not BRIDGE_ENABLED:
+        return None
+    last_error = None
+    if BRIDGE_REP_ADDRESS:
+        try:
+            return _bridge_call_zmq(method, args, kwargs)
+        except Exception as exc:
+            last_error = exc
+    if BRIDGE_PIPE_ADDRESS:
+        try:
+            return _bridge_call_pipe(method, args, kwargs)
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None and _bridge_should_report_error():
+        print("QMT_DATA_EXPORT_BRIDGE_UNAVAILABLE error=%s" % last_error)
+    return None
+
+
+def _push_bridge_snapshot(source="", force=False):
+    global _LAST_BRIDGE_PUSH_AT
+    if not BRIDGE_ENABLED:
+        return False
+    now = time.time()
+    if not force and now - _LAST_BRIDGE_PUSH_AT < float(BRIDGE_PUSH_SECONDS or 1.0):
+        return False
+    _LAST_BRIDGE_PUSH_AT = now
+    payload = _snapshot_payload()
+    payload["bridge_source"] = source
+    response = _bridge_call("qmt_bridge.update", [payload], {"instance_id": _instance_id()})
+    ok = isinstance(response, (list, tuple)) and len(response) >= 1 and bool(response[0])
+    if ok:
+        with _LOCK:
+            _CACHE["network"] = {"enabled": True, "mode": "client", "rep": BRIDGE_REP_ADDRESS, "pipe": BRIDGE_PIPE_ADDRESS, "last_push": _now_text()}
+    return ok
+
+
 def _zmq_loop():
     global _ZMQ_CONTEXT, _REP_SOCKET, _PUB_SOCKET, _ZMQ
     try:
@@ -1395,9 +1585,21 @@ def _append_command_ack(command, ok, payload=None, error=""):
 
 
 def _process_command_file(context):
-    global _COMMAND_OFFSET
+    global _COMMAND_OFFSET, _COMMAND_FILE_DISABLED, _COMMAND_FILE_DISABLE_LOGGED
+    if _COMMAND_FILE_DISABLED:
+        return 0
     path = _command_file_path()
-    if not os.path.exists(path):
+    try:
+        exists = os.path.exists(path)
+    except Exception as exc:
+        if _is_forbidden_fileio(exc):
+            _COMMAND_FILE_DISABLED = True
+            if not _COMMAND_FILE_DISABLE_LOGGED:
+                _COMMAND_FILE_DISABLE_LOGGED = True
+                print("QMT_DATA_EXPORT_COMMAND_FILE_DISABLED error=%s" % exc)
+            return 0
+        raise
+    if not exists:
         return 0
     count = 0
     try:
@@ -1435,7 +1637,13 @@ def _process_command_file(context):
                 _log_error("process_command", exc)
         return count
     except Exception as exc:
-        _log_error("process_command_file", exc)
+        if _is_forbidden_fileio(exc):
+            _COMMAND_FILE_DISABLED = True
+            if not _COMMAND_FILE_DISABLE_LOGGED:
+                _COMMAND_FILE_DISABLE_LOGGED = True
+                print("QMT_DATA_EXPORT_COMMAND_FILE_DISABLED error=%s" % exc)
+        else:
+            _log_error("process_command_file", exc)
         return count
 
 
@@ -1450,6 +1658,7 @@ def _on_quote_push(*args, **kwargs):
             if ticks:
                 _write_ticks(_CONTEXT, ticks, "subscribe_quote")
                 _write_snapshots(force=False)
+                _push_bridge_snapshot("subscribe_quote")
                 return
     except Exception as exc:
         _log_error("on_quote_push", exc)
@@ -1505,6 +1714,7 @@ def _collect(context, source):
         _collect_static(context)
         _write_support_inventory(context)
     _write_snapshots(force=False)
+    _push_bridge_snapshot(source)
     if ticks_written or bars_written:
         print("QMT_DATA_EXPORT rows ticks=%s bars=%s source=%s" % (_ROW_COUNTS["ticks"], _ROW_COUNTS["bars"], source))
     return ticks_written + bars_written
@@ -1524,6 +1734,7 @@ def init(ContextInfo):
     _start_zmq()
     _collect(ContextInfo, "init")
     _write_snapshots(force=True)
+    _push_bridge_snapshot("init", force=True)
     print("QMT_DATA_EXPORT_INIT instance=%s symbols=%s accounts=%s output=%s" % (_instance_id(), ",".join(_symbols()), ",".join([a.get("account_id", "") for a in _trade_accounts(ContextInfo)]), _output_root()))
 
 

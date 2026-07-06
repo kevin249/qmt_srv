@@ -11,6 +11,7 @@
 - QMT 内策略默认不绑定 REP/PUB 端口，避免多开端口冲突
 - qmt_srv 通过每个 QMT 的 `qmt_data_export/commands/inbox.jsonl` 下发订阅、账号等命令
 - QMT 策略把 tick、bar、历史、合约、财务、账号、持仓、委托、成交等数据导出到本地目录
+- 如果 QMT 策略环境禁止 FileIO，策略会关闭本地文件输出，改用同一个 qmt_srv REP 端口或 Windows 命名管道把快照上报给 qmt_srv，不新增对外端口
 - qmt_srv 聚合所有 QMT 导出目录后，兼容旧的 `send_pyobj([method, args, kwargs]) -> [ok, payload]` 调用方式
 
 ## 配置
@@ -150,6 +151,8 @@ sock.send_pyobj(["subscribe", [{"vt_symbol": "600460.SH"}], {"qmt_path": "D:\\�
 脚本会把 GBK 编码的 `qmt_data_export_bridge_strategy.py` 复制到每个 QMT `python` 目录，并生成该 QMT 专用的 `qmt_data_export_bridge_config.json`。这个配置只包含实例名、账号和命令文件设置，不会给每个 QMT 单独设置对外端口。
 
 如果 QMT 日志里出现 `instance=bin.x64` 或导出目录落在 `bin.x64\qmt_data_export`，说明 QMT 正在运行旧策略或没有读到同步脚本生成的运行配置。重新执行上面的同步脚本，并在 QMT 里重新加载策略。新版策略即使从 `bin.x64` 启动，也会优先把数据导出到 QMT 根目录下的 `python\qmt_data_export`，和 qmt_srv 读取目录保持一致。
+
+如果 QMT 日志里出现 `PermissionError: Foribdden FileIO`，说明当前策略沙箱禁止直接写 CSV/JSON。新版策略会打印一次 `QMT_DATA_EXPORT_FILE_OUTPUT_DISABLED`，随后继续通过 qmt_srv 桥接上报内存快照；这时本地 CSV 可能不会生成，但旧 REP/PUB 查询仍可从 qmt_srv 的内存快照读取实时数据。
 
 ## 启动
 

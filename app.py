@@ -121,6 +121,20 @@ def read_json(path: Path, default: Any, *, strict: bool = False) -> Any:
         return default
 
 
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def append_jsonl(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(json_safe(payload), ensure_ascii=False, sort_keys=True))
+        fh.write("\n")
+
+
 def strip_json_comments(text: str) -> str:
     result: list[str] = []
     index = 0
@@ -662,6 +676,10 @@ def decode_rpc(raw: bytes) -> tuple[str, list[Any], dict[str, Any]]:
                 obj = json.loads(raw.decode("utf-8"))
             except Exception as json_exc:
                 raise ValueError(f"failed to decode RPC request as pickle or JSON: {loose_exc}") from json_exc
+    return decode_rpc_object(obj)
+
+
+def decode_rpc_object(obj: Any) -> tuple[str, list[Any], dict[str, Any]]:
     if isinstance(obj, (list, tuple)) and len(obj) >= 3:
         return str(obj[0]), list(obj[1] or []), dict(obj[2] or {})
     if isinstance(obj, dict):
@@ -682,14 +700,107 @@ class QmtSrv:
             str(csv_config.get("default_adjust") or "前复权"),
         )
         self.clients: dict[str, dict[str, Any]] = {}
+        self.bridge_snapshots: dict[str, dict[str, Any]] = {}
+        self.bridge_snapshot_ttl = float(config.get("bridge_snapshot_ttl_seconds") or 30.0)
+        self.bridge_pipe_address = str(config.get("bridge_pipe_address") or r"\\.\pipe\qmt_srv_bridge")
+        self.bridge_pipe_authkey = str(config.get("bridge_pipe_authkey") or "qmt_srv_bridge").encode("utf-8")
+        self.bridge_pipe_thread: threading.Thread | None = None
+        self.bridge_pipe_listener: Any = None
         self.stop_event = threading.Event()
 
     def load_snapshot(self, instance: QmtInstance) -> dict[str, Any]:
+        bridge_snapshot = self.bridge_snapshots.get(instance.instance_id)
+        if isinstance(bridge_snapshot, dict):
+            received_at = float(bridge_snapshot.get("_bridge_received_at") or 0.0)
+            if received_at <= 0.0 or time.time() - received_at <= self.bridge_snapshot_ttl:
+                snapshot = dict(bridge_snapshot)
+                snapshot.pop("_bridge_received_at", None)
+                snapshot.setdefault("instance", {"id": instance.instance_id, "qmt_root": str(instance.python_dir.parent)})
+                snapshot.setdefault("transport", "qmt_bridge")
+                return snapshot
         snapshot = read_json(instance.snapshot_file, {})
         if not isinstance(snapshot, dict):
             snapshot = {}
         snapshot.setdefault("instance", {"id": instance.instance_id, "qmt_root": str(instance.python_dir.parent)})
         return snapshot
+
+    def update_bridge_snapshot(self, args: list[Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+        snapshot = args[0] if args and isinstance(args[0], dict) else kwargs.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise ValueError("qmt_bridge.update requires a snapshot object")
+        instance_meta = snapshot.get("instance") if isinstance(snapshot.get("instance"), dict) else {}
+        incoming_instance_id = str(kwargs.get("instance_id") or instance_meta.get("id") or "").strip()
+        instance_id = incoming_instance_id
+        qmt_root = str(instance_meta.get("qmt_root") or "").strip()
+        qmt_root_paths = qmt_path_match_values(qmt_root)
+        for instance in self.instances:
+            if instance.instance_id == incoming_instance_id or (qmt_root_paths and self._matches_instance(instance, qmt_root, qmt_root_paths)):
+                instance_id = instance.instance_id
+                break
+        if instance_id == incoming_instance_id and incoming_instance_id not in {item.instance_id for item in self.instances} and len(self.instances) == 1:
+            instance_id = self.instances[0].instance_id
+        if not instance_id:
+            raise ValueError("qmt_bridge.update requires instance_id")
+        safe_snapshot = json_safe(snapshot)
+        if not isinstance(safe_snapshot, dict):
+            raise ValueError("qmt_bridge.update snapshot is not serializable")
+        if incoming_instance_id and incoming_instance_id != instance_id:
+            safe_snapshot["bridge_instance_id"] = incoming_instance_id
+        safe_snapshot["_bridge_received_at"] = time.time()
+        safe_snapshot["transport"] = "qmt_bridge"
+        self.bridge_snapshots[instance_id] = safe_snapshot
+        self.persist_bridge_snapshot(instance_id, safe_snapshot)
+        return {"ok": True, "instance_id": instance_id, "commands": []}
+
+    def persist_bridge_snapshot(self, instance_id: str, snapshot: dict[str, Any]) -> None:
+        instance = next((item for item in self.instances if item.instance_id == instance_id), None)
+        if instance is None:
+            return
+        try:
+            persisted = dict(snapshot)
+            persisted.pop("_bridge_received_at", None)
+            persisted["persisted_at"] = now_text()
+            write_json(instance.snapshot_file, persisted)
+            append_jsonl(instance.export_dir / "bridge" / f"snapshots_{datetime.now().strftime('%Y%m%d')}.jsonl", persisted)
+        except Exception as exc:
+            print(f"QMT_SRV_BRIDGE_PERSIST_ERROR instance_id={instance_id} error={exc}", file=sys.stderr)
+
+    def start_bridge_pipe(self) -> None:
+        if os.name != "nt" or not self.bridge_pipe_address:
+            return
+        if self.bridge_pipe_thread is not None and self.bridge_pipe_thread.is_alive():
+            return
+
+        def run() -> None:
+            try:
+                from multiprocessing.connection import Listener
+
+                listener = Listener(self.bridge_pipe_address, family="AF_PIPE", authkey=self.bridge_pipe_authkey)
+                self.bridge_pipe_listener = listener
+                print(f"QMT_SRV_BRIDGE_PIPE_STARTED address={self.bridge_pipe_address}")
+                while not self.stop_event.is_set():
+                    conn = listener.accept()
+                    try:
+                        method, args, kwargs = decode_rpc_object(conn.recv())
+                        payload = self.handle_rpc(method, args, kwargs)
+                        conn.send([True, json_safe(payload)])
+                    except Exception as exc:
+                        try:
+                            conn.send([False, str(exc)])
+                        except Exception:
+                            pass
+                        print(f"QMT_SRV_BRIDGE_PIPE_ERROR error={exc}", file=sys.stderr)
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+            except Exception as exc:
+                if not self.stop_event.is_set():
+                    print(f"QMT_SRV_BRIDGE_PIPE_DISABLED error={exc}", file=sys.stderr)
+
+        self.bridge_pipe_thread = threading.Thread(target=run, name="qmt-srv-bridge-pipe", daemon=True)
+        self.bridge_pipe_thread.start()
 
     def aggregate(self) -> dict[str, Any]:
         snapshots: dict[str, Any] = {}
@@ -851,6 +962,8 @@ class QmtSrv:
         return commands
 
     def handle_rpc(self, method: str, args: list[Any], kwargs: dict[str, Any]) -> Any:
+        if method in {"qmt_bridge.update", "qmt_bridge.snapshot"}:
+            return self.update_bridge_snapshot(args, kwargs)
         aggregate = self.aggregate()
         if method == "register_client":
             name = str(args[0] if args else kwargs.get("client_name", "unknown"))
@@ -983,6 +1096,7 @@ class QmtSrv:
         pub.bind(self.pub_address)
         poller = zmq.Poller()
         poller.register(rep, zmq.POLLIN)
+        self.start_bridge_pipe()
         print(f"QMT_SRV_STARTED rep={self.rep_address} pub={self.pub_address} instances={len(self.instances)}")
         last_pub = 0.0
         try:
@@ -1008,6 +1122,11 @@ class QmtSrv:
         except KeyboardInterrupt:
             pass
         finally:
+            try:
+                if self.bridge_pipe_listener is not None:
+                    self.bridge_pipe_listener.close()
+            except Exception:
+                pass
             rep.close(0)
             pub.close(0)
             ctx.term()

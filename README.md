@@ -162,6 +162,35 @@ python app.py --config .\config.user.json
 - REP: `tcp://127.0.0.1:20140`
 - PUB: `tcp://127.0.0.1:20141`
 
+### Python 启动错误排查
+
+如果启动时出现下面错误，不要执行 `uv pip install encodings`：
+
+```text
+Fatal Python error: Failed to import encodings module
+ModuleNotFoundError: No module named 'encodings'
+```
+
+`encodings` 是 Python 标准库，不是 pip 包。这个错误一般表示当前命令行拿到的 Python 运行时坏了，或者 `PYTHONHOME` / `PYTHONPATH` 指到了 QMT、MiniQMT 或其他不完整 Python 目录。
+
+优先用仓库里的虚拟环境启动：
+
+```powershell
+Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe -c "import encodings; import sys; print(sys.executable)"
+.\.venv\Scripts\python.exe app.py --config .\config.user.json
+```
+
+如果 `.venv` 本身也报同样错误，重建虚拟环境：
+
+```powershell
+deactivate
+Remove-Item -Recurse -Force .\.venv
+uv venv --python 3.13 .venv
+uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
+```
+
 ## 旧接口兼容
 
 已支持的常用方法包括：

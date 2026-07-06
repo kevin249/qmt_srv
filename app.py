@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import io
 import json
 import os
@@ -21,6 +22,23 @@ DEFAULT_REP_ADDRESS = "tcp://*:20140"
 DEFAULT_PUB_ADDRESS = "tcp://*:20141"
 DEFAULT_CONFIG_PATH = BASE_DIR / "config.user.json"
 TEMPLATE_CONFIG_PATH = BASE_DIR / "config.template.json"
+ADJUST_FOLDERS: dict[Any, str] = {
+    "前复权": "前复权",
+    "不复权": "不复权",
+    "后复权": "后复权",
+    "front": "前复权",
+    "back": "后复权",
+    "none": "不复权",
+    "": "不复权",
+    "forward": "前复权",
+    "backward": "后复权",
+    "qfq": "前复权",
+    "hfq": "后复权",
+    0: "不复权",
+    1: "前复权",
+    2: "后复权",
+}
+MINUTE_PERIODS = {"tick", "1m", "5m", "15m", "30m", "60m", "1h"}
 
 
 class LooseUnpickler(pickle.Unpickler):
@@ -53,13 +71,58 @@ def now_text() -> str:
 
 def read_json(path: Path, default: Any) -> Any:
     try:
-        with path.open("r", encoding="utf-8-sig") as fh:
-            return json.load(fh)
+        text = path.read_text(encoding="utf-8-sig")
+        return json.loads(strip_json_comments(text))
     except FileNotFoundError:
         return default
     except Exception as exc:
         print(f"QMT_SRV_JSON_IGNORED path={path} error={exc}", file=sys.stderr)
         return default
+
+
+def strip_json_comments(text: str) -> str:
+    result: list[str] = []
+    index = 0
+    in_string = False
+    escaped = False
+    length = len(text)
+    while index < length:
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < length else ""
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            index += 2
+            while index < length and text[index] not in "\r\n":
+                index += 1
+            continue
+        if char == "/" and next_char == "*":
+            index += 2
+            while index + 1 < length and not (text[index] == "*" and text[index + 1] == "/"):
+                index += 1
+            index += 2 if index + 1 < length else 0
+            continue
+        if char == "#" and (not result or result[-1] in "\r\n"):
+            index += 1
+            while index < length and text[index] not in "\r\n":
+                index += 1
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
 
 
 def json_safe(value: Any, depth: int = 0) -> Any:
@@ -92,6 +155,31 @@ def normalize_list(value: Any) -> list[Any]:
             return [x.strip() for x in text.replace(";", ",").replace(" ", ",").split(",") if x.strip()]
         return [text]
     return [value]
+
+
+def value_from(value: Any, *names: str, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        for name in names:
+            if name in value and value.get(name) not in (None, ""):
+                return value.get(name)
+        return default
+    for name in names:
+        try:
+            item = getattr(value, name)
+            if item not in (None, ""):
+                return item
+        except Exception:
+            pass
+    return default
+
+
+def enum_value(value: Any) -> Any:
+    try:
+        return value.value
+    except Exception:
+        return value
 
 
 def normalize_symbol(raw: Any) -> str:
@@ -182,6 +270,22 @@ def extract_symbols(value: Any) -> list[str]:
         for item in value:
             result.extend(extract_symbols(item))
         return list(dict.fromkeys(result))
+    for key in (
+        "vt_symbol",
+        "vtSymbol",
+        "symbol",
+        "stock",
+        "stock_code",
+        "stockCode",
+        "code",
+        "instrument",
+        "secid",
+        "security",
+        "wind_code",
+        "name",
+        "stock_name",
+    ):
+        result.extend(extract_symbols(value_from(value, key)))
     return result
 
 
@@ -212,6 +316,17 @@ def extract_accounts(value: Any) -> list[dict[str, Any]]:
         for item in value:
             result.extend(extract_accounts(item))
         return dedupe_accounts(result)
+    account_id = value_from(value, "account_id", "accountId", "accountID", "acc_id", "accID", "account", "fund_account")
+    if account_id:
+        return dedupe_accounts(
+            [
+                {
+                    "account_id": str(account_id).strip(),
+                    "account_type": str(value_from(value, "account_type", "accountType", "type", default="STOCK") or "STOCK"),
+                    "name": str(value_from(value, "name", "label", default="") or ""),
+                }
+            ]
+        )
     return result
 
 
@@ -240,12 +355,46 @@ def resolve_python_dir(path_value: Any) -> Path:
         path = (Path.cwd() / path).resolve()
     if path.name.lower() == "python":
         return path
+    if path.name.lower() in {"bin.x64", "userdata", "userdata_mini"}:
+        path = path.parent
+    if path.suffix.lower() == ".exe":
+        path = path.parent
     candidate = path / "python"
     return candidate if candidate.exists() else path
 
 
+def qmt_python_dir_from_xt_path(path_value: Any) -> str:
+    path = Path(str(path_value or "")).expanduser()
+    if not path:
+        return ""
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    if path.name.lower() in {"bin.x64", "userdata", "userdata_mini"}:
+        path = path.parent
+    if path.suffix.lower() == ".exe":
+        path = path.parent
+    return str(path / "python")
+
+
 def normalize_instances(config: dict[str, Any]) -> list[QmtInstance]:
     raw_instances = config.get("qmt_instances") or config.get("instances") or config.get("qmt_dirs") or []
+    if not raw_instances and isinstance(config.get("xt"), dict):
+        xt_config = config["xt"]
+        qmt_path = xt_config.get("qmt_path")
+        if qmt_path:
+            raw_instances = [
+                {
+                    "instance_id": xt_config.get("instance_id") or "legacy_xt",
+                    "python_dir": qmt_python_dir_from_xt_path(qmt_path),
+                    "accounts": [
+                        {
+                            "account_id": xt_config.get("account_id"),
+                            "account_type": xt_config.get("account_type") or "STOCK",
+                            "name": "legacy_xt",
+                        }
+                    ],
+                }
+            ]
     instances: list[QmtInstance] = []
     for index, raw in enumerate(normalize_list(raw_instances), start=1):
         if isinstance(raw, str):
@@ -271,10 +420,166 @@ def load_config(config_path: Path | None) -> dict[str, Any]:
     config = read_json(path, {})
     if not isinstance(config, dict):
         config = {}
+    rpc_config = config.get("rpc") if isinstance(config.get("rpc"), dict) else {}
+    if "rep_address" not in config and rpc_config.get("rep_address"):
+        config["rep_address"] = rpc_config["rep_address"]
+    if "pub_address" not in config and rpc_config.get("pub_address"):
+        config["pub_address"] = rpc_config["pub_address"]
     config.setdefault("rep_address", DEFAULT_REP_ADDRESS)
     config.setdefault("pub_address", DEFAULT_PUB_ADDRESS)
     config.setdefault("snapshot_publish_seconds", 1.0)
     return config
+
+
+class CsvDataSource:
+    def __init__(self, base_path: str, default_adjust: str = "前复权") -> None:
+        self.base_path = str(base_path or "").strip()
+        self.default_adjust = ADJUST_FOLDERS.get(default_adjust, "前复权")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_path)
+
+    def query(
+        self,
+        symbol: str,
+        start_time: Any = "",
+        end_time: Any = "",
+        period: str = "1d",
+        adjust_type: Any = None,
+    ) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        period = normalize_period(period)
+        if period in MINUTE_PERIODS:
+            return self.query_minute(symbol, start_time, end_time)
+        return self.query_daily(symbol, start_time, end_time, adjust_type)
+
+    def query_daily(self, symbol: str, start_time: Any, end_time: Any, adjust_type: Any) -> list[dict[str, Any]]:
+        adjust = ADJUST_FOLDERS.get(adjust_type, self.default_adjust) if adjust_type is not None else self.default_adjust
+        path = Path(self.base_path) / "1day" / adjust / f"{symbol_code(symbol)}.csv"
+        if not path.is_file():
+            return []
+        start_dt = parse_datetime(start_time)
+        end_dt = parse_datetime(end_time)
+        rows: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8-sig", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                dt = parse_datetime(row.get("日期"))
+                if dt is None:
+                    continue
+                dt = dt.replace(hour=15, minute=0, second=0, microsecond=0)
+                if start_dt is not None and dt < start_dt:
+                    continue
+                if end_dt is not None and dt > end_dt:
+                    continue
+                rows.append(
+                    {
+                        "time": dt,
+                        "open": to_float(row.get("开盘价")),
+                        "high": to_float(row.get("最高价")),
+                        "low": to_float(row.get("最低价")),
+                        "close": to_float(row.get("收盘价")),
+                        "volume": to_float(row.get("成交量（股）") or row.get("成交量")),
+                        "amount": to_float(row.get("成交额（元）") or row.get("成交额")),
+                        "openInterest": 0.0,
+                    }
+                )
+        return rows
+
+    def query_minute(self, symbol: str, start_time: Any, end_time: Any) -> list[dict[str, Any]]:
+        start_dt = parse_datetime(start_time)
+        end_dt = parse_datetime(end_time)
+        start_year = start_dt.year if start_dt else datetime.now().year
+        end_year = end_dt.year if end_dt else start_year
+        if end_year < start_year:
+            end_year = start_year
+        rows: list[dict[str, Any]] = []
+        for year in range(start_year, end_year + 1):
+            path = Path(self.base_path) / "1min" / "前复权" / str(year) / f"{symbol_code(symbol)}.csv"
+            if not path.is_file():
+                continue
+            rows.extend(read_minute_csv(path, start_dt, end_dt))
+        return rows
+
+
+def read_minute_csv(path: Path, start_dt: datetime | None, end_dt: datetime | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            dt = parse_datetime(row.get("时间"))
+            if dt is None:
+                continue
+            if start_dt is not None and dt < start_dt:
+                continue
+            if end_dt is not None and dt > end_dt:
+                continue
+            rows.append(
+                {
+                    "time": dt,
+                    "open": to_float(row.get("开盘价")),
+                    "high": to_float(row.get("最高价")),
+                    "low": to_float(row.get("最低价")),
+                    "close": to_float(row.get("收盘价")),
+                    "volume": to_float(row.get("成交量")),
+                    "amount": to_float(row.get("成交额")),
+                    "openInterest": 0.0,
+                }
+            )
+    return rows
+
+
+def symbol_code(symbol: str) -> str:
+    normalized = normalize_symbol(symbol)
+    return normalized.split(".", 1)[0] if normalized else str(symbol).split(".", 1)[0]
+
+
+def to_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(enum_value(value)).strip()
+    if not text:
+        return None
+    text = text.replace("/", "-")
+    digits = "".join(ch for ch in text if ch.isdigit())
+    for fmt_value, fmt in (
+        (digits[:14], "%Y%m%d%H%M%S"),
+        (digits[:8], "%Y%m%d"),
+        (text[:19], "%Y-%m-%d %H:%M:%S"),
+        (text[:10], "%Y-%m-%d"),
+    ):
+        if len(fmt_value) != len(datetime.now().strftime(fmt)):
+            continue
+        try:
+            return datetime.strptime(fmt_value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def normalize_period(value: Any) -> str:
+    text = str(enum_value(value) or "").strip().lower()
+    mapping = {
+        "minute": "1m",
+        "min": "1m",
+        "1min": "1m",
+        "m1": "1m",
+        "daily": "1d",
+        "day": "1d",
+        "d": "1d",
+    }
+    return mapping.get(text, text or "1d")
 
 
 def decode_rpc(raw: bytes) -> tuple[str, list[Any], dict[str, Any]]:
@@ -299,6 +604,11 @@ class QmtSrv:
         self.pub_address = str(config.get("pub_address") or DEFAULT_PUB_ADDRESS)
         self.publish_seconds = float(config.get("snapshot_publish_seconds") or 1.0)
         self.instances = normalize_instances(config)
+        csv_config = config.get("csv_data_source") if isinstance(config.get("csv_data_source"), dict) else {}
+        self.csv_source = CsvDataSource(
+            str(csv_config.get("path") or config.get("csv_data_path") or ""),
+            str(csv_config.get("default_adjust") or "前复权"),
+        )
         self.clients: dict[str, dict[str, Any]] = {}
         self.stop_event = threading.Event()
 
@@ -336,6 +646,7 @@ class QmtSrv:
             trades.extend(self._tag_rows(snapshot.get("trades"), instance.instance_id))
         return {
             "updated_at": now_text(),
+            "config": self.config_status(),
             "instances": [self.instance_meta(item) for item in self.instances],
             "snapshots": snapshots,
             "ticks": ticks,
@@ -348,6 +659,29 @@ class QmtSrv:
             "positions": positions,
             "orders": orders,
             "trades": trades,
+        }
+
+    def config_status(self) -> dict[str, Any]:
+        rpc_config = self.config.get("rpc") if isinstance(self.config.get("rpc"), dict) else {}
+        legacy_sections = {}
+        for name in ("xt", "rpc", "csv_data_source", "data_download", "logging"):
+            legacy_sections[name] = isinstance(self.config.get(name), dict)
+        return {
+            "rep_address": self.rep_address,
+            "pub_address": self.pub_address,
+            "legacy_sections": legacy_sections,
+            "notes": {
+                "rpc_worker_queues": "accepted for config compatibility; qmt_srv now uses one ZMQ frontend and QMT strategy export files",
+                "csv_data_source": "used as the historical-data fallback for query_history and xtdata.get_market_data_ex",
+                "data_download": "accepted for compatibility; qmt_srv no longer performs direct xtdata downloads",
+                "logging": "accepted for compatibility; only basic service console output is currently implemented",
+            },
+            "csv_data_source": {"enabled": self.csv_source.enabled, "path": self.csv_source.base_path},
+            "rpc": {
+                "trade_workers": rpc_config.get("trade_workers"),
+                "fast_workers": rpc_config.get("fast_workers"),
+                "slow_workers": rpc_config.get("slow_workers"),
+            },
         }
 
     def instance_meta(self, instance: QmtInstance) -> dict[str, Any]:
@@ -473,23 +807,55 @@ class QmtSrv:
         raise KeyError(method)
 
     def query_history(self, request: Any, aggregate: dict[str, Any]) -> Any:
-        symbols = extract_symbols(request) or list(aggregate["ticks"].keys())
-        period = "1m"
-        if isinstance(request, dict):
-            period = str(request.get("period") or request.get("interval") or period)
+        params = self.history_params(request)
+        symbols = params["symbols"] or list(aggregate["ticks"].keys())
+        period = params["period"]
         result = {}
         for symbol in symbols:
-            result[symbol] = aggregate["histories"].get(f"{symbol}|{period}") or aggregate["histories"].get(symbol) or []
+            result[symbol] = (
+                aggregate["histories"].get(f"{symbol}|{period}")
+                or aggregate["histories"].get(symbol)
+                or self.csv_source.query(
+                    symbol,
+                    params["start_time"],
+                    params["end_time"],
+                    period,
+                    params["adjust_type"],
+                )
+                or []
+            )
         return result
 
     def query_market_data(self, args: list[Any], kwargs: dict[str, Any], aggregate: dict[str, Any]) -> dict[str, Any]:
         stock_list = args[1] if len(args) >= 2 else kwargs.get("stock_list") or kwargs.get("code_list") or list(aggregate["ticks"].keys())
-        period = kwargs.get("period") or (args[2] if len(args) >= 3 else "1m")
+        period = normalize_period(kwargs.get("period") or (args[2] if len(args) >= 3 else "1m"))
+        start_time = kwargs.get("start_time") or kwargs.get("start") or (args[3] if len(args) >= 4 else "")
+        end_time = kwargs.get("end_time") or kwargs.get("end") or (args[4] if len(args) >= 5 else "")
+        adjust_type = kwargs.get("dividend_type") or kwargs.get("adjust_type") or kwargs.get("adjust")
         result = {}
         for raw in normalize_list(stock_list):
             symbol = normalize_symbol(raw)
-            result[symbol] = aggregate["histories"].get(f"{symbol}|{period}") or aggregate["histories"].get(symbol) or []
+            result[symbol] = (
+                aggregate["histories"].get(f"{symbol}|{period}")
+                or aggregate["histories"].get(symbol)
+                or self.csv_source.query(symbol, start_time, end_time, period, adjust_type)
+                or []
+            )
         return result
+
+    def history_params(self, request: Any) -> dict[str, Any]:
+        start = value_from(request, "start", "start_time", "startTime", default="")
+        end = value_from(request, "end", "end_time", "endTime", default="")
+        period = value_from(request, "period", "interval", "frequency", default="1m")
+        adjust = value_from(request, "dividend_type", "adjust_type", "adjust", default=None)
+        symbols = extract_symbols(request)
+        return {
+            "symbols": symbols,
+            "period": normalize_period(period),
+            "start_time": start,
+            "end_time": end,
+            "adjust_type": adjust,
+        }
 
     def filter_rows(self, rows: list[Any], accounts: list[dict[str, Any]]) -> list[Any]:
         accounts = dedupe_accounts(accounts)

@@ -1,7 +1,9 @@
 {
-  "rep_address": "tcp://*:20140",
-  "pub_address": "tcp://*:20141",
   "snapshot_publish_seconds": 1.0,
+  "rpc": {
+    "rep_address": "tcp://*:20140",
+    "pub_address": "tcp://*:20141"
+  },
   "qmt_instances": [
     {
       "instance_id": "ctsec_main",

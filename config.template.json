@@ -1,6 +1,4 @@
 {
-  "rep_address": "tcp://*:20140",
-  "pub_address": "tcp://*:20141",
   "snapshot_publish_seconds": 1.0,
   "qmt_instances": [
     {
@@ -8,5 +6,69 @@
       "python_dir": "D:\\迅投QMT交易终端财通证券版\\python",
       "accounts": []
     }
-  ]
+  ],
+  "xt": {
+    "token": "",
+    "stock_active": true,
+    "futures_active": false,
+    "option_active": false,
+    "simulation": false,
+    "account_type": "STOCK",
+    "qmt_path": "D:\\迅投QMT交易终端财通证券版",
+    "account_id": "",
+    "session_id": 1,
+    "connect_retries": 5,
+    "connect_retry_interval": 1.0
+  },
+  "rpc": {
+    "rep_address": "tcp://*:20140",
+    "pub_address": "tcp://*:20141",
+    "trade_workers": 1,
+    "trade_queue_size": 16,
+    "trade_queue_timeout": 0.5,
+    "fast_workers": 8,
+    "fast_queue_size": 128,
+    "fast_queue_timeout": 3.0,
+    "slow_workers": 2,
+    "slow_queue_size": 4,
+    "slow_queue_timeout": 10.0
+  },
+  "csv_data_source": {
+    "path": "Z:\\baidupan\\gupiao",
+    "default_adjust": "前复权"
+  },
+  "data_download": {
+    "daily_1min_download": 1,
+    "daily_trigger_time": "15:30",
+    "boot_data_download": 0,
+    "boot_check_startday": "",
+    "boot_check_endday": "",
+    "batch_size": 200,
+    "stock_sectors": [
+      "沪深A股"
+    ],
+    "calendar_market": "SH",
+    "dividend_type": "front",
+    "tick_history_enabled": 1
+  },
+  "logging": {
+    "enabled": true,
+    "level": "INFO",
+    "console": true,
+    "publish_rpc_log_event": true,
+    "categories": {
+      "lifecycle": true,
+      "rpc": true,
+      "market_data": true,
+      "snapshot": true,
+      "account": true,
+      "position": true,
+      "order": true,
+      "trade": true,
+      "history": true,
+      "contract": true,
+      "heartbeat": true,
+      "data_download": true
+    }
+  }
 }

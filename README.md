@@ -38,7 +38,16 @@ Copy-Item config.multi_account.example.json config.user.json
   "qmt_instances": [
     {
       "instance_id": "ctsec_01",
-      "python_dir": "D:\\迅投QMT交易终端财通证券版\\python",
+      "qmt_path": "D:\\迅投QMT交易终端财通证券版\\bin.x64",
+      "stock_active": true,
+      "futures_active": false,
+      "option_active": false,
+      "simulation": false,
+      "account_type": "STOCK",
+      "account_id": "",
+      "session_id": 1,
+      "connect_retries": 5,
+      "connect_retry_interval": 1.0,
       "accounts": [
         { "account_id": "你的账号1", "account_type": "STOCK", "name": "main" },
         { "account_id": "你的账号2", "account_type": "STOCK", "name": "backup" }
@@ -47,6 +56,19 @@ Copy-Item config.multi_account.example.json config.user.json
   ]
 }
 ```
+
+QMT 路径只写在 `qmt_instances[].qmt_path`。可以填 QMT 根目录、`bin.x64`、`userdata_mini` 或 `python` 目录，qmt_srv 和同步脚本会自动找到对应的 `python` 目录。
+
+`instance_id` 是这条 QMT 实例的唯一别名，`qmt_path` 是这个别名绑定的实际 QMT 目录。多个 QMT 客户端目录就写多条 `qmt_instances`，每条都要有不同的 `instance_id` 和自己的 `qmt_path`；同一个 QMT 客户端里的多个账号不要再拆实例，放在该实例的 `accounts` 数组里。
+
+旧 REP/PUB 客户端如果不传实例字段，命令会广播给所有 QMT；如果只想发给某一个 QMT，可以在旧的 `kwargs` 或第一个参数字典里传下面任一字段：
+
+```python
+sock.send_pyobj(["subscribe", [{"vt_symbol": "600460.SH"}], {"instance_id": "ctsec_main"}])
+sock.send_pyobj(["subscribe", [{"vt_symbol": "600460.SH"}], {"qmt_path": "D:\\迅投QMT交易终端财通证券版\\bin.x64"}])
+```
+
+`qmt_path` 路由会自动兼容 QMT 根目录、`bin.x64`、`userdata_mini` 和 `python` 目录几种写法。
 
 两个 QMT 同时管理时，第二个 QMT 继续加在 `qmt_instances` 数组里：
 
@@ -60,7 +82,16 @@ Copy-Item config.multi_account.example.json config.user.json
   "qmt_instances": [
     {
       "instance_id": "ctsec_main",
-      "python_dir": "D:\\迅投QMT交易终端财通证券版\\python",
+      "qmt_path": "D:\\迅投QMT交易终端财通证券版\\bin.x64",
+      "stock_active": true,
+      "futures_active": false,
+      "option_active": false,
+      "simulation": false,
+      "account_type": "STOCK",
+      "account_id": "",
+      "session_id": 1,
+      "connect_retries": 5,
+      "connect_retry_interval": 1.0,
       "accounts": [
         { "account_id": "10000001", "account_type": "STOCK", "name": "main" },
         { "account_id": "10000002", "account_type": "STOCK", "name": "backup" }
@@ -68,7 +99,16 @@ Copy-Item config.multi_account.example.json config.user.json
     },
     {
       "instance_id": "ctsec_second",
-      "python_dir": "D:\\第二个QMT交易终端\\python",
+      "qmt_path": "D:\\第二个QMT交易终端\\bin.x64",
+      "stock_active": true,
+      "futures_active": false,
+      "option_active": false,
+      "simulation": false,
+      "account_type": "STOCK",
+      "account_id": "",
+      "session_id": 2,
+      "connect_retries": 5,
+      "connect_retry_interval": 1.0,
       "accounts": [
         { "account_id": "20000001", "account_type": "STOCK", "name": "second-main" }
       ]
@@ -85,7 +125,6 @@ Copy-Item config.multi_account.example.json config.user.json
 - `csv_data_source`
 - `data_download`
 - `logging.categories`
-- `xt`
 
 旧服务入口仍由 `qmt_srv` 对外提供，REP/PUB 地址和旧 RPC 方法继续保留。当前只移除了 qmt_srv 进程内的 xtdata/xtquant 直连下载能力；QMT 客户端内策略负责采集并导出实时数据，qmt_srv 继续聚合导出文件并读取旧 CSV 存储目录。
 
@@ -97,10 +136,10 @@ Copy-Item config.multi_account.example.json config.user.json
 - `data_download.daily_1min_download` / `boot_data_download` / `batch_size` / `stock_sectors`：配置保留；这些原本依赖 xtdata 直连下载，当前不再由 qmt_srv 执行
 - `data_download.tick_history_enabled`：配置保留；tick 历史直连下载已随 xtdata 去除，实时 tick 由 QMT 策略导出
 - `logging.enabled` / `level` / `categories`：配置保留；当前只保留基础控制台输出和 PUB 快照，旧分类日志事件尚未完全恢复
-- `xt.qmt_path` / `account_id` / `account_type`：仍用于兼容旧配置；当没有 `qmt_instances` 时自动推导一个 QMT 实例
-- `xt.stock_active` / `futures_active` / `option_active` / `simulation` / `session_id` / `connect_retries`：配置保留；这些原本控制 xtquant 交易连接，当前不再由 qmt_srv 使用
+- `qmt_instances[].account_id` / `account_type`：仍用于实例账号配置；多账号优先使用 `accounts`
+- `qmt_instances[].stock_active` / `futures_active` / `option_active` / `simulation` / `session_id` / `connect_retries`：配置保留在实例上；这些原本控制 xtquant 交易连接，当前不再由 qmt_srv 直连使用
 
-如果旧配置里还没有 `qmt_instances`，但有 `xt.qmt_path` 和 `xt.account_id`，qmt_srv 会自动推导出一个兼容实例：`xt.qmt_path\python` 加 `xt.account_id`。
+如果旧配置里还没有 `qmt_instances`，需要把原来的 QMT 连接字段迁移到 `qmt_instances[]` 中。
 
 ## 同步策略到 QMT
 

@@ -3,22 +3,74 @@
   "qmt_instances": [
     {
       "instance_id": "ctsec_01",
-      "python_dir": "D:\\迅投QMT交易终端财通证券版\\python",
+      "qmt_path": "D:\\迅投QMT交易终端财通证券版\\bin.x64",
+      "stock_active": true,
+      "futures_active": false,
+      "option_active": false,
+      "simulation": false,
+      "account_type": "STOCK",
+      "account_id": "",
+      "session_id": 1,
+      "connect_retries": 5,
+      "connect_retry_interval": 1.0,
       "accounts": []
     }
   ],
-  "xt": {
-    "token": "",
-    "stock_active": true,
-    "futures_active": false,
-    "option_active": false,
-    "simulation": false,
-    "account_type": "STOCK",
-    "qmt_path": "D:\\迅投QMT交易终端财通证券版",
-    "account_id": "",
-    "session_id": 1,
-    "connect_retries": 5,
-    "connect_retry_interval": 1.0
+  "_examples": {
+    "note": "本段只是写法示例，qmt_srv 和 sync_qmt_strategy.ps1 会忽略 _examples。实际启用请复制到 qmt_instances 数组里。",
+    "single_qmt_multi_accounts": {
+      "instance_id": "ctsec_main",
+      "qmt_path": "D:\\迅投QMT交易终端财通证券版\\bin.x64",
+      "stock_active": true,
+      "futures_active": false,
+      "option_active": false,
+      "simulation": false,
+      "account_type": "STOCK",
+      "account_id": "",
+      "session_id": 1,
+      "connect_retries": 5,
+      "connect_retry_interval": 1.0,
+      "accounts": [
+        {
+          "account_id": "10000001",
+          "account_type": "STOCK",
+          "name": "main"
+        },
+        {
+          "account_id": "10000002",
+          "account_type": "STOCK",
+          "name": "backup"
+        }
+      ]
+    },
+    "second_qmt_instance": {
+      "instance_id": "ctsec_second",
+      "qmt_path": "D:\\第二个QMT交易终端\\bin.x64",
+      "stock_active": true,
+      "futures_active": false,
+      "option_active": false,
+      "simulation": false,
+      "account_type": "STOCK",
+      "account_id": "",
+      "session_id": 2,
+      "connect_retries": 5,
+      "connect_retry_interval": 1.0,
+      "accounts": [
+        {
+          "account_id": "20000001",
+          "account_type": "STOCK",
+          "name": "second-main"
+        }
+      ]
+    },
+    "old_rep_pub_route_kwargs": [
+      {
+        "instance_id": "ctsec_main"
+      },
+      {
+        "qmt_path": "D:\\迅投QMT交易终端财通证券版\\bin.x64"
+      }
+    ]
   },
   "rpc": {
     "rep_address": "tcp://*:20140",

@@ -55,6 +55,7 @@ class QmtInstance:
     python_dir: Path
     export_dir: Path
     accounts: list[dict[str, Any]]
+    settings: dict[str, Any]
 
     @property
     def command_file(self) -> Path:
@@ -363,55 +364,83 @@ def resolve_python_dir(path_value: Any) -> Path:
     return candidate if candidate.exists() else path
 
 
-def qmt_python_dir_from_xt_path(path_value: Any) -> str:
-    path = Path(str(path_value or "")).expanduser()
-    if not path:
-        return ""
+def resolve_qmt_python_dir(path_value: Any) -> Path:
+    path = Path(str(path_value)).expanduser()
     if not path.is_absolute():
         path = (Path.cwd() / path).resolve()
+    if path.name.lower() == "python":
+        return path
     if path.name.lower() in {"bin.x64", "userdata", "userdata_mini"}:
         path = path.parent
     if path.suffix.lower() == ".exe":
         path = path.parent
-    return str(path / "python")
+    return path / "python"
+
+
+def normalized_path_text(path_value: Any) -> str:
+    text = str(path_value or "").strip()
+    if not text:
+        return ""
+    try:
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        else:
+            path = path.resolve(strict=False)
+        return os.path.normcase(os.path.normpath(str(path)))
+    except (OSError, RuntimeError, ValueError):
+        return os.path.normcase(os.path.normpath(text))
+
+
+def qmt_path_match_values(path_value: Any) -> set[str]:
+    text = str(path_value or "").strip()
+    if not text:
+        return set()
+    values = {text, normalized_path_text(text)}
+    try:
+        python_dir = resolve_qmt_python_dir(text)
+        values.add(normalized_path_text(python_dir))
+        values.add(normalized_path_text(python_dir.parent))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return {value for value in values if value}
 
 
 def normalize_instances(config: dict[str, Any]) -> list[QmtInstance]:
     raw_instances = config.get("qmt_instances") or config.get("instances") or config.get("qmt_dirs") or []
-    if not raw_instances and isinstance(config.get("xt"), dict):
-        xt_config = config["xt"]
-        qmt_path = xt_config.get("qmt_path")
-        if qmt_path:
-            raw_instances = [
-                {
-                    "instance_id": xt_config.get("instance_id") or "legacy_xt",
-                    "python_dir": qmt_python_dir_from_xt_path(qmt_path),
-                    "accounts": [
-                        {
-                            "account_id": xt_config.get("account_id"),
-                            "account_type": xt_config.get("account_type") or "STOCK",
-                            "name": "legacy_xt",
-                        }
-                    ],
-                }
-            ]
     instances: list[QmtInstance] = []
     for index, raw in enumerate(normalize_list(raw_instances), start=1):
         if isinstance(raw, str):
-            raw = {"python_dir": raw}
+            raw = {"qmt_path": raw}
         if not isinstance(raw, dict):
             continue
-        python_value = raw.get("python_dir") or raw.get("qmt_python_dir") or raw.get("qmt_dir") or raw.get("path")
-        if not python_value:
+        python_value = raw.get("python_dir") or raw.get("qmt_python_dir")
+        qmt_path_value = raw.get("qmt_path") or raw.get("qmt_dir") or raw.get("path")
+        if python_value:
+            python_dir = resolve_python_dir(python_value)
+        elif qmt_path_value:
+            python_dir = resolve_qmt_python_dir(qmt_path_value)
+        else:
             continue
-        python_dir = resolve_python_dir(python_value)
         export_value = raw.get("export_dir")
         export_dir = Path(str(export_value)).expanduser() if export_value else python_dir / "qmt_data_export"
         if not export_dir.is_absolute():
             export_dir = (Path.cwd() / export_dir).resolve()
         instance_id = str(raw.get("instance_id") or raw.get("id") or python_dir.parent.name or f"qmt_{index}").strip()
-        accounts = dedupe_accounts(extract_accounts(raw.get("accounts") or raw.get("account_ids") or raw.get("account_id")))
-        instances.append(QmtInstance(instance_id=instance_id, python_dir=python_dir, export_dir=export_dir, accounts=accounts))
+        accounts = dedupe_accounts([*extract_accounts(raw.get("accounts") or raw.get("account_ids")), *extract_accounts(raw)])
+        settings = {
+            "qmt_path": str(qmt_path_value or python_value or ""),
+            "stock_active": bool(raw.get("stock_active", True)),
+            "futures_active": bool(raw.get("futures_active", False)),
+            "option_active": bool(raw.get("option_active", False)),
+            "simulation": bool(raw.get("simulation", False)),
+            "account_type": str(raw.get("account_type") or "STOCK"),
+            "account_id": str(raw.get("account_id") or ""),
+            "session_id": raw.get("session_id", 1),
+            "connect_retries": raw.get("connect_retries", 5),
+            "connect_retry_interval": raw.get("connect_retry_interval", 1.0),
+        }
+        instances.append(QmtInstance(instance_id=instance_id, python_dir=python_dir, export_dir=export_dir, accounts=accounts, settings=settings))
     return instances
 
 
@@ -664,7 +693,7 @@ class QmtSrv:
     def config_status(self) -> dict[str, Any]:
         rpc_config = self.config.get("rpc") if isinstance(self.config.get("rpc"), dict) else {}
         legacy_sections = {}
-        for name in ("xt", "rpc", "csv_data_source", "data_download", "logging"):
+        for name in ("rpc", "csv_data_source", "data_download", "logging"):
             legacy_sections[name] = isinstance(self.config.get(name), dict)
         return {
             "rep_address": self.rep_address,
@@ -692,6 +721,7 @@ class QmtSrv:
             "snapshot_file": str(instance.snapshot_file),
             "command_file": str(instance.command_file),
             "accounts": instance.accounts,
+            "settings": instance.settings,
             "snapshot_exists": instance.snapshot_file.exists(),
         }
 
@@ -718,14 +748,43 @@ class QmtSrv:
                 result.append({"value": row, "instance_id": instance_id})
         return result
 
+    @staticmethod
+    def _extract_instance_selector(value: Any) -> str:
+        if not isinstance(value, dict):
+            return ""
+        for key in ("instance_id", "qmt_instance", "qmt_path", "qmt_dir", "python_dir", "qmt_python_dir"):
+            selected = str(value.get(key) or "").strip()
+            if selected:
+                return selected
+        return ""
+
+    @staticmethod
+    def _matches_instance(instance: QmtInstance, wanted: str, wanted_paths: set[str]) -> bool:
+        if instance.instance_id == wanted:
+            return True
+        raw_paths = {
+            str(instance.python_dir),
+            str(instance.python_dir.parent),
+            str(instance.settings.get("qmt_path") or ""),
+        }
+        if wanted in raw_paths:
+            return True
+        instance_paths: set[str] = set()
+        for raw_path in raw_paths:
+            instance_paths.update(qmt_path_match_values(raw_path))
+        return bool(wanted_paths & instance_paths)
+
     def target_instances(self, args: list[Any], kwargs: dict[str, Any]) -> list[QmtInstance]:
-        wanted = str(kwargs.get("instance_id") or kwargs.get("qmt_instance") or kwargs.get("qmt_dir") or "").strip()
-        for value in args:
-            if isinstance(value, dict):
-                wanted = str(value.get("instance_id") or value.get("qmt_instance") or wanted).strip()
+        wanted = self._extract_instance_selector(kwargs)
+        if not wanted:
+            for value in args:
+                wanted = self._extract_instance_selector(value)
+                if wanted:
+                    break
         if not wanted or wanted in ("*", "all"):
             return self.instances
-        return [item for item in self.instances if item.instance_id == wanted or str(item.python_dir.parent) == wanted]
+        wanted_paths = qmt_path_match_values(wanted)
+        return [item for item in self.instances if self._matches_instance(item, wanted, wanted_paths)]
 
     def write_command(self, instance: QmtInstance, method: str, args: list[Any], kwargs: dict[str, Any]) -> dict[str, Any]:
         instance.command_file.parent.mkdir(parents=True, exist_ok=True)

@@ -7,7 +7,16 @@
   "qmt_instances": [
     {
       "instance_id": "ctsec_main",
-      "python_dir": "D:\\迅投QMT交易终端财通证券版\\python",
+      "qmt_path": "D:\\迅投QMT交易终端财通证券版\\bin.x64",
+      "stock_active": true,
+      "futures_active": false,
+      "option_active": false,
+      "simulation": false,
+      "account_type": "STOCK",
+      "account_id": "",
+      "session_id": 1,
+      "connect_retries": 5,
+      "connect_retry_interval": 1.0,
       "accounts": [
         {
           "account_id": "10000001",
@@ -23,7 +32,16 @@
     },
     {
       "instance_id": "ctsec_second",
-      "python_dir": "D:\\第二个QMT交易终端\\python",
+      "qmt_path": "D:\\第二个QMT交易终端\\bin.x64",
+      "stock_active": true,
+      "futures_active": false,
+      "option_active": false,
+      "simulation": false,
+      "account_type": "STOCK",
+      "account_id": "",
+      "session_id": 2,
+      "connect_retries": 5,
+      "connect_retry_interval": 1.0,
       "accounts": [
         {
           "account_id": "20000001",

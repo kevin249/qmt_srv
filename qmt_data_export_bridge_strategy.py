@@ -29,6 +29,12 @@ SNAPSHOT_REFRESH_SECONDS = 3
 TRADE_REFRESH_SECONDS = 5
 WRITE_DUPLICATE_TICKS = False
 SUBSCRIBE_TICK_IN_INIT = True
+BRIDGE_VERSION = "20260706_fileio_bridge_v2"
+
+try:
+    print("QMT_DATA_EXPORT_MODULE_LOADED version=%s file=%s" % (BRIDGE_VERSION, globals().get("__file__", "")))
+except Exception:
+    pass
 
 ENABLE_LEGACY_ZMQ = False
 LEGACY_REP_ADDRESS = "tcp://*:20140"
@@ -1722,6 +1728,7 @@ def _collect(context, source):
 
 def init(ContextInfo):
     global _CONTEXT, _LAST_STATIC_AT, _LAST_TRADE_AT
+    print("QMT_DATA_EXPORT_INIT_ENTER version=%s file=%s" % (BRIDGE_VERSION, globals().get("__file__", "")))
     _CONTEXT = ContextInfo
     _load_runtime_config(force=True)
     _LAST_TRADE_AT = 0

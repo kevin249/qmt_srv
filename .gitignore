@@ -5,3 +5,4 @@ qmt_data_export_bridge_config.json
 __pycache__/
 .pytest_cache/
 .venv/
+*.swp

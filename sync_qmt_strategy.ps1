@@ -62,7 +62,9 @@ foreach ($Instance in $Instances) {
     }
 
     $StrategyTarget = Join-Path $PythonDir "qmt_data_export_bridge_strategy.py"
+    $StrategyAliasTarget = Join-Path $PythonDir "QMT_BRIDGE.py"
     Copy-Item -LiteralPath $StrategySource -Destination $StrategyTarget -Force
+    Copy-Item -LiteralPath $StrategySource -Destination $StrategyAliasTarget -Force
 
     $RuntimeAccounts = @()
     foreach ($Account in @($Instance.accounts)) {
@@ -102,5 +104,6 @@ foreach ($Instance in $Instances) {
     $RuntimeConfig | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $RuntimeConfigPath -Encoding UTF8
 
     Write-Host "synced $InstanceId -> $StrategyTarget"
+    Write-Host "synced $InstanceId -> $StrategyAliasTarget"
     Write-Host "config $InstanceId -> $RuntimeConfigPath"
 }

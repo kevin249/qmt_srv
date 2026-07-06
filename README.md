@@ -148,7 +148,9 @@ sock.send_pyobj(["subscribe", [{"vt_symbol": "600460.SH"}], {"qmt_path": "D:\\�
 .\sync_qmt_strategy.ps1 -ConfigPath .\config.user.json
 ```
 
-脚本会把 GBK 编码的 `qmt_data_export_bridge_strategy.py` 复制到每个 QMT `python` 目录，并生成该 QMT 专用的 `qmt_data_export_bridge_config.json`。这个配置只包含实例名、账号和命令文件设置，不会给每个 QMT 单独设置对外端口。
+脚本会把 GBK 编码的 `qmt_data_export_bridge_strategy.py` 复制到每个 QMT `python` 目录，同时生成兼容别名 `QMT_BRIDGE.py`，并生成该 QMT 专用的 `qmt_data_export_bridge_config.json`。这个配置只包含实例名、账号和命令文件设置，不会给每个 QMT 单独设置对外端口。
+
+如果 QMT 日志里没有 `QMT_DATA_EXPORT_MODULE_LOADED` 和 `QMT_DATA_EXPORT_INIT_ENTER`，说明 QMT 没有加载到新版桥接策略。重新执行上面的同步脚本，并在 QMT 里选择 `qmt_data_export_bridge_strategy.py` 或 `QMT_BRIDGE.py` 重新加载。
 
 如果 QMT 日志里出现 `instance=bin.x64` 或导出目录落在 `bin.x64\qmt_data_export`，说明 QMT 正在运行旧策略或没有读到同步脚本生成的运行配置。重新执行上面的同步脚本，并在 QMT 里重新加载策略。新版策略即使从 `bin.x64` 启动，也会优先把数据导出到 QMT 根目录下的 `python\qmt_data_export`，和 qmt_srv 读取目录保持一致。
 
